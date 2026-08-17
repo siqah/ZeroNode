@@ -1,0 +1,86 @@
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/zeronode
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: zeronode
+      POSTGRES_PASSWORD: zeronode
+      POSTGRES_DB: zeronode
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeronode -d zeronode"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  neo4j-init:
+    image: neo4j:5.26-community
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ./infra/neo4j:/cypher:ro
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        cypher-shell -a bolt://neo4j:7687 -u neo4j -p zeronode "MATCH (n) DETACH DELETE n"
+        cypher-shell -a bolt://neo4j:7687 -u neo4j -p zeronode --file /cypher/schema.cypher
+        cypher-shell -a bolt://neo4j:7687 -u neo4j -p zeronode --file /cypher/seed.cypher
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: zeronode
+      DATABASE_URL: postgresql://zeronode:zeronode@postgres:5432/zeronode
+      # Deliberately not ${OLLAMA_BASE_URL}: the host .env points at 127.0.0.1,
+      # which inside the container resolves to the container itself.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e4b}
+      OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-640}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - api
+
+volumes:
+  neo4j_data:
+  pg_data:

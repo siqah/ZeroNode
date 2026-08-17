@@ -1,0 +1,8 @@
+CREATE CONSTRAINT device_name IF NOT EXISTS
+FOR (d:Device) REQUIRE d.name IS UNIQUE;
+
+CREATE CONSTRAINT interface_id IF NOT EXISTS
+FOR (i:Interface) REQUIRE i.id IS UNIQUE;
+
+CREATE CONSTRAINT zone_name IF NOT EXISTS
+FOR (z:SecurityZone) REQUIRE z.name IS UNIQUE;
