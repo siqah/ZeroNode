@@ -253,6 +253,102 @@ button {
   font-size: 13px;
 }
 
+.error {
+  color: var(--red);
+  font-size: 13px;
+  margin: 10px 0 0;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.session {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.btn-link {
+  background: none;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  padding: 4px 10px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.btn-link:hover {
+  color: var(--text);
+}
+
+.login {
+  max-width: 380px;
+  margin: 40px auto;
+  min-height: 0;
+}
+
+.notice {
+  min-height: 0;
+  margin: 0 0 20px;
+  border-left: 3px solid var(--amber, #d19a26);
+}
+
+.notice h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.notice input {
+  width: 180px;
+  background: #070b10;
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 10px;
+  font-family: inherit;
+  font-size: 14px;
+  margin-right: 10px;
+}
+
+.login h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.login label {
+  display: block;
+  margin: 16px 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.login input {
+  width: 100%;
+  background: #070b10;
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 10px;
+  font-family: inherit;
+  font-size: 14px;
+}
+
+.login button {
+  width: 100%;
+  margin-top: 20px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .verdict {
   margin: 12px 0;
   padding: 12px 14px;

@@ -22,6 +22,10 @@ class InMemoryTopology:
     def known_devices(self) -> list[str]:
         return sorted(self.devices)
 
+    def device_ip(self, device_name: str) -> str | None:
+        node = self.devices.get(device_name)
+        return node.get("ip") if node else None
+
     def path_trace(self, source_device: str, target_device: str) -> list[str] | None:
         if source_device not in self.devices or target_device not in self.devices:
             return None

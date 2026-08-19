@@ -1,4 +1,8 @@
-from app.verify import evaluate_flow, parse_acl_command, verify_change
+from app.firewall.mock import MockFirewall
+from app.firewall.policy import evaluate_flow, parse_acl_command
+from app.verify import verify_change
+
+FW = MockFirewall()
 
 FLOW = [
     {
@@ -42,7 +46,7 @@ def test_parse_cidr_and_line_number():
 
 def test_permit_appended_below_the_deny_is_shadowed():
     report = verify_change(
-        _action("permit tcp 10.10.1.0/24 10.20.1.0/24 eq 443"), FLOW
+        _action("permit tcp 10.10.1.0/24 10.20.1.0/24 eq 443"), FLOW, FW
     )
     assert report.ok is False
     assert any(line.startswith("FAIL") for line in report.lines)
@@ -52,7 +56,7 @@ def test_permit_appended_below_the_deny_is_shadowed():
 
 def test_position_argument_places_the_rule_above_the_deny():
     report = verify_change(
-        _action("permit tcp host 10.10.1.10 host 10.20.1.50 eq 443", position=39), FLOW
+        _action("permit tcp host 10.10.1.10 host 10.20.1.50 eq 443", position=39), FLOW, FW
     )
     assert report.ok is True
     assert any("inserting at line 39" in line for line in report.lines)
@@ -60,7 +64,7 @@ def test_position_argument_places_the_rule_above_the_deny():
 
 def test_subnet_wide_permit_is_rejected_as_over_permissive():
     report = verify_change(
-        _action("permit tcp 10.10.1.0/24 10.20.1.0/24 eq 443", position=39), FLOW
+        _action("permit tcp 10.10.1.0/24 10.20.1.0/24 eq 443", position=39), FLOW, FW
     )
     assert report.ok is False
     assert any(line.startswith("SCOPE") for line in report.lines)
@@ -70,7 +74,7 @@ def test_subnet_wide_permit_is_rejected_as_over_permissive():
 
 def test_any_port_permit_is_flagged():
     report = verify_change(
-        _action("permit tcp host 10.10.1.10 host 10.20.1.50", position=39), FLOW
+        _action("permit tcp host 10.10.1.10 host 10.20.1.50", position=39), FLOW, FW
     )
     assert report.ok is False
     assert any("every port" in line for line in report.lines)
@@ -78,14 +82,14 @@ def test_any_port_permit_is_flagged():
 
 def test_permit_above_the_deny_verifies():
     report = verify_change(
-        _action("line 39 permit tcp host 10.10.1.10 host 10.20.1.50 eq 443"), FLOW
+        _action("line 39 permit tcp host 10.10.1.10 host 10.20.1.50 eq 443"), FLOW, FW
     )
     assert report.ok is True
     assert any(line.startswith("PASS") for line in report.lines)
 
 
 def test_unparseable_command_fails_verification():
-    report = verify_change(_action("please open the firewall"), FLOW)
+    report = verify_change(_action("please open the firewall"), FLOW, FW)
     assert report.ok is False
     assert "could not parse" in " ".join(report.lines)
 

@@ -36,8 +36,10 @@ flowchart LR
     Graph --> Ollama[(Ollama<br/>gemma4:e4b)]
     Graph --> Tools[Deterministic tools]
     Tools --> Neo4j[(Neo4j<br/>topology)]
-    Tools --> Mocks[(Mock firewall<br/>telemetry)]
+    Tools --> FW[(FirewallStore<br/>mock or read-only ASA)]
     Graph --> PG[(Postgres<br/>checkpoints + incidents)]
+    API --> Auth{{Auth + RBAC}}
+    Auth --> Ledger[(Signed approval ledger)]
     API --> Web[Next.js dashboard<br/>apps/web]
     Web -->|approve / reject| API
 ```
@@ -59,12 +61,14 @@ Everything runs on one machine. No telemetry leaves it, and the model is local.
 4. **Poll.** The dashboard polls `GET /api/v1/incidents/{id}/status`, which derives status from
    the graph snapshot rather than storing it: if `execute_change` is next, the incident is
    `awaiting_approval`.
-5. **Decide.** `POST /api/v1/incidents/{id}/resume` with `approve` or `reject`. This resumes the
-   interrupted graph with `Command(resume=True, update={...})`. Resuming an incident that is not
-   paused returns `409`.
-6. **Record.** On approve, `execute_change` re-runs the simulation, writes a `DRY-RUN approved
-   (VERIFIED|NOT VERIFIED)` summary and ends. On reject, the engineer's feedback is injected as a
-   message and control returns to the specialist to revise.
+5. **Decide.** `POST /api/v1/incidents/{id}/resume` with `approve` or `reject`, which requires an
+   authenticated human holding the `approver` role. The decision, the actor and the evidence they
+   were shown are sealed into the approval ledger *before* the graph resumes with
+   `Command(resume=True, update={...})`. Resuming an incident that is not paused returns `409`.
+6. **Record.** On approve, `execute_change` re-runs the simulation and writes a `DRY-RUN approved
+   by <actor> (VERIFIED|NOT VERIFIED)` summary. On reject, the engineer's feedback is injected as
+   a message and control returns to the specialist to revise. The caller gets a receipt carrying
+   the ledger hash.
 
 ---
 
@@ -99,6 +103,7 @@ worst bug in the project's history.
 | `pending_actions` | The change waiting at the gate, with its verification verdict |
 | `verification` | Simulator output lines shown in the UI |
 | `verify_attempts` | Correction budget, capped at 3 |
+| `alert_flags` | What the incoming alert text looked like it was trying to do, if anything |
 | `reasoning_trace` / `tool_log` | Append-only audit of decisions and raw tool output |
 | `human_decision` / `human_feedback` | Injected on resume |
 
@@ -173,6 +178,19 @@ SCOPE the rule permits 64,516 host pairs but only 1 is evidenced
 Subnet-to-subnet widening to fix one blocked flow is how segmentation quietly dies, so the
 simulator demands least privilege and suggests the host-to-host form.
 
+**Reversal.** Every proposal carries the command that undoes it, and that command is simulated
+too. If the model supplies a `rollback` it is used; if not, the removal is derived from the change
+(`no ` plus the same line), and the gate says which of the two happened. Either way the reversal is
+applied to the post-change policy and the flow must land back on the verdict it had before — a
+rollback that removes a different rule, or leaves the flow open, fails the same way a shadowed
+permit does, and the model gets the failure and revises. A compensating rule is accepted instead
+of a removal when it demonstrably restores the previous verdict, because not every shop reverses a
+change by deleting a line.
+
+The point is narrow and worth stating: this proves the reversal is the correct inverse of the
+change, not that pasting it at three in the morning will fix a broken network. Anything else the
+change disturbed is out of scope until execution is real.
+
 The simulation runs **at proposal time**, so a change that fails is never shown to a human — the
 model gets the failure and revises, up to three attempts. It runs **again after approval** so the
 audit record reflects what was signed off. If the model exhausts its attempts, the change is still
@@ -181,7 +199,160 @@ asking a human to look.
 
 ---
 
-## 9. Data stores
+## 9. Identity, roles and the approval ledger
+
+Approving a firewall change is the one privileged action in the system, so it is the one the
+security model is built around.
+
+### Roles
+
+Four ordered roles, not a permission matrix, because there is one privileged action and a policy
+engine would be more machinery than the problem deserves.
+
+| Role | Can |
+| --- | --- |
+| `viewer` | Read incidents, traces and the audit ledger |
+| `operator` | Everything above, plus trigger investigations |
+| `approver` | Everything above, plus approve or reject a proposed change |
+| `admin` | Everything above, plus manage users |
+
+Humans authenticate with a password (Argon2) and a TOTP code, and receive a short-lived JWT.
+Machines — an alerting system opening an incident — use a static service token pinned to
+`operator`. Two separate rules stop a machine from approving: the role ladder, and an explicit
+check that the principal is not a service credential. A service token granted `approver` by
+mistake still cannot sign an approval.
+
+### Sessions
+
+The browser never holds the session token where script can read it. Login sets `zn_session` as an
+httpOnly cookie, which means an XSS bug can abuse a session but cannot exfiltrate one. That trade
+reintroduces CSRF, since the browser attaches cookies to requests any site can trigger, so a
+second value is bound to the session token and must come back in an `X-CSRF-Token` header on every
+state-changing request. A header is exactly what a cross-site form post cannot set. Machine
+clients keep using bearer tokens, which are neither stored in the browser nor sent automatically.
+
+Login is throttled per IP and per account (`SlidingWindow`, in process), and an account locks for
+`LOGIN_LOCK_MINUTES` after `LOGIN_LOCK_THRESHOLD` consecutive failures. The lock lives in Postgres
+rather than memory so it survives a restart and applies to every replica; the in-process window is
+a first line of defence that multiplies by replica count, which is why it is not the only one. An
+admin can clear a lock with `POST /api/v1/auth/users/{email}/unlock`.
+
+### Second factor
+
+`MFA_REQUIRED_FOR_APPROVERS` is on by default, and an approval from a session that did not present
+a TOTP code is refused with a `403` explaining how to enrol. The session token records whether a
+second factor was used, so the requirement is enforced at approval time without prompting again
+mid-decision. Enrolment issues a secret that only becomes active once a code generated from it is
+confirmed, which stops an account locking itself out of approvals with a mistyped setup. TOTP is
+implemented directly against RFC 6238 in `app/auth/totp.py` and tested against the published
+vectors.
+
+### The ledger
+
+Every approve and reject is written to `approvals` before the graph resumes, carrying the actor,
+their role, and the evidence they were shown: the proposed commands, the simulator verdict, the
+denied flows, and the topology context. Reconstructing after the fact what an engineer saw when
+they clicked approve is the whole point.
+
+Four independent properties, each doing a different job:
+
+1. **Hash chain.** Each record commits to its predecessor's hash, so editing or removing one
+   invalidates every record after it. Tampering is detectable even by someone who can write SQL.
+2. **Ed25519 signature.** Only the holder of the signing key can produce a valid record, so a row
+   inserted directly into the table does not verify. The public keys are published at
+   `GET /api/v1/audit/key` so an auditor can check the ledger without trusting the API.
+3. **Append-only in the database.** A trigger rejects `UPDATE` and `DELETE` on the table outright.
+4. **An anchor outside the database.** The chain head and record count are appended to
+   `AUDIT_ANCHOR_FILE` after every write, signed. This is the only one of the four that survives
+   the table being dropped.
+
+The fourth exists because the first three share a blind spot. Someone who owns the database can
+delete the whole ledger or restore an older backup, and what remains verifies perfectly — it is
+simply shorter, and nothing in it says so. Verification therefore compares the live chain against
+the last anchor: fewer records than were anchored means deletion or rollback, and a different hash
+at the anchored index means history below it was rewritten. Put the anchor on a volume Postgres
+cannot write to, or it proves nothing.
+
+**Key rotation.** The ledger trusts a set of keys, not one. `AUDIT_SIGNING_KEY` signs new records;
+the public halves of previous keys stay in `AUDIT_RETIRED_KEYS` so everything signed before the
+rotation still verifies. `python -m app.audit.keys rotate` prints both values. On startup, if the
+active key differs from the one that signed the last record, a `key-rotation` record is appended
+to the chain, so an auditor sees where the key changed instead of inferring it from a verification
+failure.
+
+`GET /api/v1/audit/verify` re-derives every hash and signature across all trusted keys, checks the
+anchor, and reports the first break with its index and cause.
+
+The system refuses to act on a decision it cannot record: if the ledger is unreachable while auth
+is enabled, approval returns `503` rather than resuming the graph. An unrecorded approval binds
+nobody, so it is not worth having.
+
+### When a change may be approved
+
+A correct change at the wrong hour is still an incident, so the gate asks *when* as well as
+*whether*. `CHANGE_WINDOWS` lists the hours changes are allowed (`mon-fri 22:00-04:00; sat,sun
+08:00-18:00`), `CHANGE_FREEZES` lists dates where nothing goes out (`2026-12-20..2027-01-02`), and
+both are evaluated in `CHANGE_WINDOW_TZ` rather than in whatever timezone the server happens to
+run in. Windows may span midnight, and an overnight window belongs to the day it started on. A
+freeze always beats a window. No configuration means always open, so the control is opt-in.
+
+Three decisions shape how it behaves:
+
+- **Only approvals are gated.** Rejecting a proposal is always safe, and blocking it would only
+  strand incidents until the next window.
+- **The window is visible before anyone clicks.** The status endpoint carries the current verdict
+  and the next opening time, so the dashboard shows a closed window at the gate rather than
+  returning an error after the decision.
+- **Break-glass exists, and costs something.** An outage does not wait for Tuesday night. An admin
+  — not an approver — may override, must write a reason of real length, and both the reason and
+  the window that was overridden are sealed into the approval record. A control with no override
+  gets bypassed at the process level, where nothing records it.
+
+### Where it is still thin
+
+There is no SSO: accounts are local, so onboarding and offboarding are manual and there is no
+central place to revoke access. Sessions cannot be revoked before they expire, since a JWT is
+valid until its `exp`. Authorisation has no per-incident or per-device scoping — an approver can
+approve anything — and no second-person rule for high-blast-radius changes.
+
+---
+
+## 10. Untrusted input
+
+Everything the agent reads from outside is attacker-influenced. A webhook body can be forged or
+replayed, and a device configuration can carry an ACL remark written by whoever last had config
+access. Both end up as text in the same context window as the system prompt, which is where
+prompt injection lives.
+
+`app/sanitize.py` handles the boundary in three steps:
+
+1. **Strip what could impersonate the protocol.** The parser scans free text for
+   `<tool_call>{...}</tool_call>`, so an alert containing that string could otherwise write
+   directly into the tool-call channel. Those markers are removed, invisible and bidi characters
+   are dropped so nothing can hide from the human reading the same text, and over-long input is
+   truncated.
+2. **Fence it as data.** The alert reaches the model wrapped in `<untrusted_alert>` with an
+   instruction that it describes symptoms and is never itself an instruction.
+3. **Name the attempt.** Recognisable steering — instruction override, role reassignment, pressure
+   to skip approval, a request for `permit ip any any` — is recorded in `alert_flags`, logged, shown
+   at the approval gate and sealed into the approval record. Nothing is blocked: an alert that
+   looks manipulated may still be a real outage, and dropping it would be the more dangerous
+   failure.
+
+Tool output gets the same cleaning on its way into the message history, because a device remark is
+a place someone can leave a message for a model.
+
+None of this is the security boundary, and treating it as one would be a mistake — pattern
+matching on natural language is defeated by rephrasing. The boundary is structural, and it is
+unchanged by anything the alert says: the agent cannot execute, only propose; a proposal is
+simulated against policy read from the device rather than against anything the alert claims; the
+scope check compares the rule to denied flows that came from the firewall; and a human with a
+second factor signs before anything is logged as approved. A poisoned alert can waste an
+investigation. It cannot widen a rule on its own.
+
+---
+
+## 11. Data stores
 
 - **Neo4j** holds the topology: `Device`, `Interface`, `SecurityZone`, and the `CONNECTS_TO`,
   `HAS_INTERFACE`, `BELONGS_TO` relationships. Schema and seed are in `infra/neo4j/`. On startup
@@ -189,25 +360,132 @@ asking a human to look.
   self-heals.
 - **Postgres** holds the LangGraph checkpoints (`AsyncPostgresSaver`) and an `incidents` index
   table. Checkpointing is what makes the human gate durable: the paused thread survives a restart.
-- **Mock firewall** (`apps/api/app/mocks/firewall.py`) provides denied flows and ACL hit
-  counters. This is the largest piece of fiction in the system and the first thing to replace.
+- **Firewall** sits behind the `FirewallStore` interface (`apps/api/app/firewall/base.py`), which
+  is read-only by construction: it can return policy, denied flows, hit counters and a NAT
+  assessment, and has no method that changes a device. Three backends implement it, selected by
+  `FIREWALL_BACKEND`:
+  - `mock` (default) serves the lab fixtures, so tests need no hardware.
+  - `cisco_asa` parses `show access-list`, `show object-group`, `show running-config object` and
+    `show nat`.
+  - `cisco_ios` parses `show ip access-lists`, converting wildcard bits to prefixes, and reads
+    `show ip nat translations`.
 
-Both stores degrade rather than crash: without Neo4j the API uses an in-memory copy of the lab
-topology, and without Postgres it uses an in-memory checkpointer. Convenient for development,
-dangerous in production, since the fallback is silent apart from a log line.
+  Both device backends share one SSH transport (`app/firewall/ssh.py`) that reuses a single
+  session, retries once on a dropped pipe, and refuses any command not beginning with `show` by
+  raising `ReadOnlyViolation`. The one non-`show` command that ever reaches a device is Netmiko's
+  own paging control during session setup, which is session-scoped and changes no configuration.
+
+  ACL semantics live in `app/firewall/policy.py`, independent of where the rules came from, so a
+  fixture, a live device and a rule the model has only proposed are all evaluated identically.
+  Lines the parser cannot model are kept as `unparsed` rules rather than dropped. If one sits
+  above the proposed insertion point the simulator returns `INCONCLUSIVE` instead of a verdict,
+  because a rule it cannot read might match the flow first.
+
+Real policies are written against object-groups, so resolving them is what makes the simulator
+usable outside the lab. Two paths, in order of preference:
+
+1. **The device's own expansion.** `show access-list` prints the summary rule followed by
+   indented, fully expanded elements. When those are present they are authoritative and the
+   summary line is discarded — no second command, no reimplementation of Cisco's semantics.
+2. **`show object-group` and `show running-config object`**, fetched only when step 1 leaves
+   something unparsed, as with `show running-config access-list`. `app/firewall/objectgroup.py`
+   flattens nested groups and named objects with a cycle guard and expands the rule into the cross
+   product of sources, destinations and ports. Named objects cover `host`, `subnet` and `range`
+   (summarised into prefixes) plus service objects; groups may reference objects and objects may
+   be referenced from either side.
+
+Expansion refuses to guess. A member the parser does not understand — an FQDN object, an
+unsupported qualifier, a reference to something that no longer exists — marks the whole group
+incomplete, and any rule using it stays unparsed. Narrowing a rule silently because part of it was
+unreadable would produce exactly the false confidence this layer exists to prevent.
+
+### NAT
+
+On ASA 8.3 and later an ACL matches the real address of a host, not the translated one. Our
+evidence comes from deny logs and from whatever the operator typed, either of which may be the
+mapped side, so simulating against the wrong side would produce a confident answer about the wrong
+packet. The adapters therefore detect translation rather than model it: if any non-identity NAT
+rule could touch an address in the flow, verification returns `INCONCLUSIVE` and asks a human to
+confirm the untranslated addresses. Identity NAT is excluded, because it leaves addresses
+unchanged, and NAT rules that cannot be resolved are reported as a note rather than treated as
+either a match or an all-clear.
+
+### Validating a real device
+
+No test proves that a particular production device prints what the parser expects, so that gap is
+closed by running one command instead of by trusting the code:
+
+```bash
+cd apps/api && .venv/bin/python -m app.firewall.probe \
+  --backend cisco_asa --host 192.0.2.10 --username readonly \
+  --acl DMZ_TO_TRUST --flow 10.10.1.10,10.20.1.50,443
+```
+
+A Containerlab node is the sensible first target for this, before any production appliance; see
+"Test environments" in the production plan.
+
+It connects read-only and reports how many ACL entries were read, how many were modelled, the
+exact text of any that were not, whether NAT touches the flow, the verdict for that flow, and
+whether the read-only guard held. It exits `0` when everything was modelled, `1` when some entries
+were not, and `2` when the device could not be read. Unmodelled lines are safe — the simulator
+degrades to `INCONCLUSIVE` — but they limit coverage, and the printed text is what the parser
+needs to be extended with.
+
+### Credentials
+
+Nothing sensitive has to live in an environment variable. Any credential setting may instead name
+where the value lives:
+
+```
+FIREWALL_PASSWORD=file:/run/secrets/asa_password
+FIREWALL_PASSWORD=vault:secret/data/zeronode#asa_password
+FIREWALL_PASSWORD=exec:aws secretsmanager get-secret-value --secret-id asa --query SecretString
+JWT_SECRET=env:JWT_SECRET_FROM_INIT_CONTAINER
+```
+
+The reason is not secrecy in the abstract. A password in the environment is readable by anything
+that can see the process, is printed by `docker inspect`, is copied into crash reports, and rotates
+only with a restart. A reference is none of those things: device credentials are resolved at the
+moment a session opens rather than held on the object, and resolved values are cached only for
+`SECRET_CACHE_SECONDS`, so rotating at the source takes effect without a restart. Failures are
+loud and never carry the value — the error names the source, not the secret.
+
+`REQUIRE_MANAGED_SECRETS` (on by default) makes this a rule rather than an option: the API refuses
+to open an SSH session to a real device with an inline credential. It applies only to device
+backends, so `mock` needs no setup, and it does not apply to a password typed at the probe's
+prompt, which is the one case where an inline value is the safe one.
+
+### Failing loudly
+
+Both stores used to degrade quietly: no Neo4j meant the in-memory lab topology, no Postgres meant
+an in-memory checkpointer, and the only sign was a log line. That is the worst possible behaviour
+for this system. An agent reasoning over the lab fixture will confidently trace a path through a
+network that is not yours, and an approval written to an in-memory ledger is an approval that
+never happened.
+
+With `STRICT_DEPENDENCIES` on, which is the default, an unreachable store fails startup with a
+message saying what is lost. Postgres is opened with `wait=True` so an unreachable database fails
+at boot rather than on the first query. Turning it off restores the fallbacks, and every one of
+them is then reported: `GET /health` lists the active degradations and returns `503` while any
+exist, so a container running on fixtures does not look healthy to Compose, Kubernetes or a
+monitor. Disabled auth, an ephemeral signing key and an unanchored ledger are listed there too,
+for the same reason.
 
 ---
 
-## 10. The dashboard
+## 12. The dashboard
 
 `apps/web` is a Next.js app polling with SWR. The incident view shows the reasoning trace, the
 raw tool log, the path visualiser, and the approval gate. The gate shows the proposed command,
-the model's rationale, and the simulator verdict in green or red, so the engineer is never asked
-to approve a command whose effect has not been demonstrated.
+the model's rationale, the simulator verdict in green or red, the verified rollback, whether the
+change window is open, and any flags raised by the alert text, so the engineer is never asked to
+approve a command whose effect, reversal or timing has not been demonstrated. When the window is
+closed the approve button is disabled for everyone but an admin, who has to write a break-glass
+reason before it unlocks.
 
 ---
 
-## 11. Configuration
+## 13. Configuration
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -218,10 +496,34 @@ to approve a command whose effect has not been demonstrated.
 | `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | `bolt://localhost:7687` / `neo4j` / `zeronode` | |
 | `DATABASE_URL` | `postgresql://...@localhost:5433/zeronode` | Port 5433 to avoid colliding with a local Postgres |
 | `CORS_ORIGINS` | `http://localhost:3000` | |
+| `AUTH_ENABLED` | `true` | Setting it false opens every endpoint and makes approvals unattributable. Logged loudly at startup |
+| `JWT_SECRET` | empty | Unset means a random secret per process: sessions die on restart and replicas reject each other's tokens |
+| `JWT_TTL_MINUTES` | `60` | |
+| `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | empty | First admin, created on startup if absent. Without it and with no users, nobody can log in, which is logged as an error |
+| `SERVICE_TOKEN` | empty | Static token for alerting systems. Pinned to `operator`, and can never approve |
+| `COOKIE_SECURE` | `false` | Set true once the dashboard is behind TLS, or session cookies travel in clear |
+| `LOGIN_RATE_LIMIT` / `LOGIN_RATE_WINDOW_SECONDS` | `10` / `60` | Per-IP and per-account throttle. In process, so it multiplies by replica count |
+| `LOGIN_LOCK_THRESHOLD` / `LOGIN_LOCK_MINUTES` | `5` / `15` | Consecutive failures before an account locks, and for how long. Stored in Postgres |
+| `MFA_REQUIRED_FOR_APPROVERS` | `true` | Off means an approval rests on a single stealable credential |
+| `AUDIT_SIGNING_KEY` | empty | Ed25519 seed for the ledger. Unset means an ephemeral key, so records cannot be verified after a restart |
+| `AUDIT_RETIRED_KEYS` | empty | Public keys of previous signing keys, comma separated, so records survive a rotation |
+| `AUDIT_ANCHOR_FILE` | empty | Where the chain head is anchored. Unset means deleting the ledger leaves no trace |
+| `FIREWALL_BACKEND` | `mock` | `mock`, `cisco_asa` or `cisco_ios`. The device backends need `pip install -e "apps/api[devices]"` |
+| `FIREWALL_HOST` / `FIREWALL_USERNAME` / `FIREWALL_PASSWORD` | empty | Read-only device credentials. The password must be a secret reference unless `REQUIRE_MANAGED_SECRETS` is off |
+| `FIREWALL_SECRET` | empty | Enable secret, only if `show` output needs privilege 15 |
+| `FIREWALL_ACL` | empty | Restricts `show access-list` to one ACL. Empty reads them all |
+| `FIREWALL_DEVICE_ID` | `FW_Edge` | Topology device name this backend answers for |
+| `CHANGE_WINDOWS` | empty | When changes may be approved, e.g. `mon-fri 22:00-04:00`. Empty means any time |
+| `CHANGE_FREEZES` | empty | Dates when nothing goes out, e.g. `2026-12-20..2027-01-02`. Beats any window |
+| `CHANGE_WINDOW_TZ` | `UTC` | Evaluated here, not in the server's local timezone |
+| `SECRET_CACHE_SECONDS` | `300` | How long a resolved secret is reused. Lower means a rotation applies sooner |
+| `VAULT_ADDR` / `VAULT_TOKEN` | empty | Needed only for `vault:` references. KV v1 and v2 |
+| `REQUIRE_MANAGED_SECRETS` | `true` | Refuse to open a device session with an inline credential |
+| `STRICT_DEPENDENCIES` | `true` | Refuse to start on an unreachable store instead of falling back to fixtures |
 
 ---
 
-## 12. Running and testing
+## 14. Running and testing
 
 ```bash
 cp .env.example .env
@@ -231,7 +533,7 @@ cd apps/web && npm install && npm run dev
 
 ```bash
 cd apps/api
-.venv/bin/pytest -q                     # 33 tests, no Ollama needed
+.venv/bin/pytest -q                     # 208 tests, no Ollama or device needed
 .venv/bin/ruff check app tests
 python ../../scripts/golden_path.py     # scripted end-to-end run
 python ../../scripts/probe_turn.py      # print the model's raw reply for one turn
@@ -243,48 +545,96 @@ instead of the several minutes a full incident needs on CPU.
 
 ---
 
-## 13. Known limitations
+## 15. Known limitations
 
 Being explicit about these matters more than the feature list.
 
-- **Firewall telemetry is mocked.** Denied flows and ACL hits are fixtures. The simulator
-  verifies against that fixture, not against a device.
-- **No authentication or authorisation.** Anyone who can reach the API can trigger an
-  investigation and approve a change. There is no notion of who approved what.
+- **No device backend has been run against real hardware.** Parsers are tested against captured
+  output and the transport is a thin Netmiko wrapper, but nothing here has met a live appliance
+  with its own banners, prompts and timeouts. `python -m app.firewall.probe` exists to close this
+  in one read-only command; until someone runs it against a given device, that device is
+  unproven.
+- **Expansion has ceilings**: port ranges wider than 64, address ranges spanning more than 16
+  prefixes, and rules expanding past 2,048 combinations are left unparsed rather than
+  materialised.
+- **Two vendors.** Cisco ASA and IOS; NX-OS, Palo Alto and Fortinet are unimplemented.
+- **NAT is detected, not modelled.** A translated flow makes the simulator decline to give a
+  verdict rather than reason through the translation, so those incidents fall back to a human.
+- **No SSO, and sessions cannot be revoked** before their token expires. Authorisation is not
+  scoped per device or per incident, and there is no second-person rule for wide changes.
 - **Investigations do not survive a restart.** State is checkpointed, but the background task
   driving the graph is in-process; a restart leaves a thread paused mid-investigation with
   nothing to resume it.
-- **One scenario, five devices.** The lab proves the workflow, not scale.
-- **Alert text goes into the prompt unfiltered**, which is a prompt-injection path.
+- **One scenario, five devices, all of it seeded by hand.** The lab proves the workflow, not scale,
+  and the seed was written to fit the queries rather than the other way round. The ladder out of
+  this is in "Test environments" below: NetBox for a real inventory, Containerlab for a real CLI.
+- **Prompt-injection defence is mitigation, not prevention.** Alert and device text is cleaned,
+  fenced and flagged, but pattern matching on natural language loses to rephrasing. What actually
+  holds is structural: no execution, evidence read from the device, and a signed human approval.
+- **Rollback is verified as an inverse, not as a recovery procedure.** It proves the reversal
+  undoes the rule; it says nothing about anything else the change disturbed.
+- **Change windows are enforced at the gate only.** Nothing schedules a change for the next
+  window, so an incident raised during a freeze waits for a person.
+- **Secret references cover the credentials the API resolves.** `DATABASE_URL` still carries its
+  password inline, since it is consumed as a single connection string.
 - **Latency is 6–8 minutes per incident** on CPU inference.
-- **Cisco-flavoured syntax only**, with a simplistic ACL parser.
-- **Silent degradation** to in-memory stores when Neo4j or Postgres is unavailable.
 
 ---
 
-## 14. Path to production
+## 16. Path to production
 
-Ordered by what would block a first real deployment. Phase 1 is the difference between a demo and
-a pilot.
+Ordered by what would block a first real deployment. Phase 1 is the difference between a working
+system and a supervised pilot on a live network.
+
+### Test environments
+
+The phases below say what to build. This says what to build it against, because most of the
+remaining risk is not in the code — it is in the assumption that a real network resembles the
+fixtures. Three rungs, each answering a question the one below it cannot:
+
+| Rung | Environment | What it can prove | Status |
+| --- | --- | --- | --- |
+| L1 | Static fixtures and a seeded Neo4j graph | The state machine, the parsers and the simulator, deterministically and with no hardware | Current |
+| L2 | A local NetBox container with 10–20 interconnected virtual devices | That the graph layer answers relational questions against a real source of truth, not a hand-written seed | Not started |
+| L3 | Containerlab with three nodes, two switches and a firewall | That a proposed policy diff maps onto real interface configuration, and that the read paths survive a live CLI | Not started |
+
+L1 is deliberately where the unit tests stay. Determinism is the point: a parser test that needs a
+container is a parser test people stop running. What L1 cannot do is tell you whether the topology
+model survives contact with a real inventory, because the seed was written to fit the queries.
+
+L2 replaces the hand-seeded graph with an ingest from NetBox, which is where the current
+`ensure_seed` shortcut breaks: twenty devices with real interfaces and terminations will produce
+paths the traversal has never seen, and freshness becomes a property the agent has to reason about
+rather than assume. This is the concrete first step of "topology ingestion" in Phase 5, and it can
+be done before anything executes.
+
+L3 is where the read paths meet a live CLI — real banners, paging, prompts and timeouts — which is
+exactly what `python -m app.firewall.probe` was built to measure, and it is the honest place to
+run it before pointing at production hardware. It is also the only environment where executing a
+change is safe to attempt, so it gates Phase 2 rather than sitting alongside it.
+
+One naming note to avoid confusion: these rungs are labelled L1–L3 because the numbered phases
+below already mean something different. L1 is where the project is today, and it spans all of
+Phase 1.
 
 ### Phase 1 — Safety and trust (blocking)
 
 | Item | Why |
 | --- | --- |
-| Authentication and RBAC on every endpoint | Approving a firewall change is a privileged action; today it is anonymous |
-| Signed, immutable approval records | Who approved which command, when, on what evidence. Needed for any audit |
-| Real device adapter behind an interface | Replace `app/mocks/firewall.py` with a driver (Netmiko/NAPALM, or vendor API) reading live ACLs and counters |
-| Credential handling via a vault | Device credentials must never sit in env vars or state |
-| Change windows and freeze periods | A correct change at the wrong time is still an incident |
-| Rollback plan attached to every proposal | A change without a documented reversal should not be approvable |
-| Prompt-injection defence | Treat alert text as untrusted: strip, delimit, and never let it name tools or devices directly |
-| Remove silent fallbacks | Failing to reach Neo4j or Postgres should fail loudly, not quietly change behaviour |
+| ~~Authentication and RBAC on every endpoint~~ | Done: password login, TOTP second factor for approvers, httpOnly cookie sessions with CSRF protection, login throttling and account lockout, four ordered roles, service tokens that cannot approve. SSO remains, and is an integration rather than a control |
+| ~~Signed, immutable approval records~~ | Done: hash-chained, Ed25519-signed, append-only in the database, anchored outside it, key rotation with a rotation marker in the chain, verifiable at `/api/v1/audit/verify` |
+| ~~Real device adapter behind an interface~~ | Done for read paths: `FirewallStore` with read-only ASA and IOS backends, object-group and named-object resolution, NAT detection, and a probe command for validating a real device. Live-hardware validation is a run, not a build |
+| ~~Credential handling via a vault~~ | Done: any credential may be a `file:`, `env:`, `vault:` or `exec:` reference, resolved at the moment of use and cached briefly so rotation needs no restart. Inline device credentials are refused by default |
+| ~~Change windows and freeze periods~~ | Done: windows and freezes in a configured timezone, enforced on approval only, visible at the gate, with an admin break-glass whose reason is sealed into the approval record |
+| ~~Rollback plan attached to every proposal~~ | Done: every proposal carries a reversal, authored or derived, and it is simulated back to the pre-change verdict before the change can be queued |
+| ~~Prompt-injection defence~~ | Done as mitigation: alert and device text is stripped of control markers and invisible characters, fenced as untrusted data, and steering attempts are flagged to the approver. The real defence stays structural |
+| ~~Remove silent fallbacks~~ | Done: unreachable stores fail startup by default, and when fallbacks are deliberately enabled `/health` reports every degradation and returns `503` |
 
 ### Phase 2 — Closing the loop
 
 | Item | Why |
 | --- | --- |
-| Execute against a real device behind a feature flag, dry-run by default | The point of the system |
+| Execute against a real device behind a feature flag, dry-run by default | The point of the system. First target is an L3 Containerlab node, not production hardware |
 | Post-change verification against live telemetry | Confirm the flow actually recovered, rather than trusting the simulation |
 | Automatic rollback on failed verification | Bounded blast radius |
 | Ticket integration (ServiceNow / Jira) | Changes must land where the organisation already tracks them |
@@ -313,9 +663,9 @@ a pilot.
 
 | Item | Why |
 | --- | --- |
-| Topology ingestion from NetBox, LLDP or SNMP, with freshness tracking | A hand-seeded graph does not survive contact with a real network |
+| Topology ingestion from NetBox, LLDP or SNMP, with freshness tracking | A hand-seeded graph does not survive contact with a real network. The L2 environment is where this starts, and it does not have to wait for Phase 5 |
 | Multi-vendor config normalisation | Cisco-only parsing is a hard ceiling |
-| More scenarios: routing, MTU, asymmetric paths, BGP | One scenario is a demo |
+| More scenarios: routing, MTU, asymmetric paths, BGP | One scenario proves the workflow, not the coverage an operator needs |
 | Multi-tenancy and per-site isolation | Required for managed-service use |
 
 ### Phase 6 — Operations

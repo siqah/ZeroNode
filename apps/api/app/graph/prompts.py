@@ -25,9 +25,10 @@ FIREWALL_PROMPT = """You are the firewall specialist. Never execute changes. Lab
 Tools:
 - get_denied_flows {source_device, target_device}
 - get_acl_hits {device_id, rule_id?}
-- propose_policy_change {device_id, command, rationale}
+- propose_policy_change {device_id, command, rationale, position?, rollback?}
 
 Sequence: get_denied_flows, optionally get_acl_hits, then propose_policy_change on FW_Edge.
+rollback is the command that undoes yours, normally "no " plus the same line.
 
 Emit the tool call FIRST. No filler.
 

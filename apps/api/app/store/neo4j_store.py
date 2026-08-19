@@ -52,6 +52,16 @@ class Neo4jTopology:
             result = session.run("MATCH (d:Device) RETURN d.name AS name ORDER BY name")
             return [record["name"] for record in result]
 
+    def device_ip(self, device_name: str) -> str | None:
+        query = """
+        MATCH (d:Device {name: $name})
+        OPTIONAL MATCH (d)-[:HAS_INTERFACE]->(i:Interface)
+        RETURN coalesce(d.management_ip, i.ip_address) AS ip
+        """
+        with self._driver.session() as session:
+            record = session.run(query, name=device_name).single()
+            return record["ip"] if record and record["ip"] else None
+
     def path_trace(self, source_device: str, target_device: str) -> list[str] | None:
         query = """
         MATCH path = shortestPath(

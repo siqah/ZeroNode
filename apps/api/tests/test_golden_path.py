@@ -65,14 +65,19 @@ def test_golden_path_approve_is_dry_run():
     graph.invoke(
         Command(
             resume=True,
-            update={"human_decision": "approve", "human_feedback": "ticket INC-1001"},
+            update={
+                "human_decision": "approve",
+                "human_feedback": "ticket INC-1001",
+                "human_actor": "alice@example.com",
+            },
         ),
         config,
     )
     snapshot = graph.get_state(config)
     assert snapshot.next == ()
     summary = snapshot.values["findings_summary"]
-    assert summary.startswith("DRY-RUN approved (VERIFIED)")
+    # The approver's identity travels into the audit summary, not just the ledger.
+    assert summary.startswith("DRY-RUN approved by alice@example.com (VERIFIED)")
     assert "not executed" in summary
     assert "permit tcp" in summary
     assert "PASS" in summary

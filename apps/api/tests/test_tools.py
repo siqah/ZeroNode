@@ -1,5 +1,7 @@
+from app.firewall.mock import MockFirewall
 from app.minify import minify_payload
 from app.store.memory import InMemoryTopology
+from app.tools import ToolContext
 from app.tools.topology import (
     AclHitsInput,
     BoundaryInput,
@@ -16,12 +18,15 @@ from app.tools.topology import (
 )
 
 
+def ctx() -> ToolContext:
+    return ToolContext(topology=InMemoryTopology(), firewall=MockFirewall())
+
+
 def test_path_trace_cross_zone():
-    topo = InMemoryTopology()
     result = handle_path_trace(
         PathTraceInput(source_device="Web_App", target_device="DB_Primary"),
         {},
-        topo,
+        ctx(),
     )
     assert result.content == (
         "Path Trace Success. Traffic flows through: "
@@ -31,22 +36,20 @@ def test_path_trace_cross_zone():
 
 
 def test_path_trace_unknown_device():
-    topo = InMemoryTopology()
     result = handle_path_trace(
         PathTraceInput(source_device="core-router-04", target_device="DB_Primary"),
         {},
-        topo,
+        ctx(),
     )
     assert result.content.startswith("Error: device 'core-router-04' not found")
     assert "Web_App" in result.content
 
 
 def test_security_boundary_crosses():
-    topo = InMemoryTopology()
     result = handle_security_boundary(
         BoundaryInput(source_device="Web_App", target_device="DB_Primary"),
         {},
-        topo,
+        ctx(),
     )
     assert "source_zone=DMZ" in result.content
     assert "dest_zone=TRUST" in result.content
@@ -54,22 +57,20 @@ def test_security_boundary_crosses():
 
 
 def test_delegate_requires_topology_first():
-    topo = InMemoryTopology()
     result = handle_delegate_firewall(
         DelegateFirewallInput(context="blocked", target_devices=["FW_Edge"]),
         {},
-        topo,
+        ctx(),
     )
     assert result.goto is None
     assert "query topology" in result.content
 
 
 def test_delegate_after_topology():
-    topo = InMemoryTopology()
     result = handle_delegate_firewall(
         DelegateFirewallInput(context="blocked", target_devices=["FW_Edge"]),
         {"topology_context": "crosses_boundary=true"},
-        topo,
+        ctx(),
     )
     assert result.goto == "firewall_specialist"
     assert result.state_update["active_worker"] == "firewall"
@@ -79,7 +80,7 @@ def test_denied_flows_minified():
     rows_msg = handle_denied_flows(
         DeniedFlowsInput(source_device="Web_App", target_device="DB_Primary"),
         {},
-        InMemoryTopology(),
+        ctx(),
     )
     assert "ACL-DMZ-47" in rows_msg.content
     assert "None" not in rows_msg.content or "syslog" not in rows_msg.content
@@ -89,7 +90,7 @@ def test_acl_hits_filter():
     result = handle_acl_hits(
         AclHitsInput(device_id="FW_Edge", rule_id="ACL-DMZ-47"),
         {},
-        InMemoryTopology(),
+        ctx(),
     )
     assert "ACL-DMZ-47" in result.content
     assert "ACL-DMZ-10" not in result.content
@@ -111,7 +112,7 @@ def test_propose_change_queues_hitl_when_simulation_passes():
             rationale="allow https",
         ),
         DENIED_FLOW_STATE,
-        InMemoryTopology(),
+        ctx(),
     )
     assert result.goto == "execute_change"
     action = result.state_update["pending_actions"][0]
@@ -127,7 +128,7 @@ def test_shadowed_change_is_not_queued_for_approval():
             rationale="allow https",
         ),
         DENIED_FLOW_STATE,
-        InMemoryTopology(),
+        ctx(),
     )
     assert result.goto is None
     assert "pending_actions" not in result.state_update
@@ -142,7 +143,7 @@ def test_change_without_evidence_is_not_queued():
             rationale="allow https",
         ),
         {},
-        InMemoryTopology(),
+        ctx(),
     )
     assert result.goto is None
     assert "No observed denied flow" in result.content

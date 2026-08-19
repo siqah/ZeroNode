@@ -6,9 +6,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.mocks import firewall as firewall_mocks
+from app.firewall.base import FirewallStore, FlowQuery
 from app.store import TopologyStore
-from app.verify import verify_change
+from app.verify import verify_change, verify_rollback
 
 MAX_VERIFY_ATTEMPTS = 3
 
@@ -41,6 +41,7 @@ class ResolveInput(BaseModel):
 class DeniedFlowsInput(BaseModel):
     source_device: str = Field(pattern=DEVICE_PATTERN)
     target_device: str = Field(pattern=DEVICE_PATTERN)
+    port: int = Field(default=443, ge=1, le=65535)
 
 
 class AclHitsInput(BaseModel):
@@ -59,6 +60,13 @@ class ProposeChangeInput(BaseModel):
             "would otherwise match first, since ACLs are evaluated in line order."
         ),
     )
+    rollback: str = Field(
+        default="",
+        description=(
+            "The command that reverses this change, usually 'no <the same command>'. "
+            "Leave empty and the removal is derived, then simulated either way."
+        ),
+    )
 
 
 @dataclass
@@ -69,11 +77,17 @@ class ToolResult:
 
 
 @dataclass
+class ToolContext:
+    topology: TopologyStore
+    firewall: FirewallStore
+
+
+@dataclass
 class ToolSpec:
     name: str
     description: str
     args_model: type[BaseModel]
-    handler: Callable[[BaseModel, dict[str, Any], TopologyStore], ToolResult]
+    handler: Callable[[BaseModel, dict[str, Any], ToolContext], ToolResult]
 
 
 def _unknown_device(name: str, topology: TopologyStore) -> str:
@@ -81,13 +95,13 @@ def _unknown_device(name: str, topology: TopologyStore) -> str:
 
 
 def handle_path_trace(
-    args: PathTraceInput, _state: dict[str, Any], topology: TopologyStore
+    args: PathTraceInput, _state: dict[str, Any], ctx: ToolContext
 ) -> ToolResult:
-    if args.source_device not in topology.known_devices():
-        return ToolResult(_unknown_device(args.source_device, topology))
-    if args.target_device not in topology.known_devices():
-        return ToolResult(_unknown_device(args.target_device, topology))
-    path = topology.path_trace(args.source_device, args.target_device)
+    if args.source_device not in ctx.topology.known_devices():
+        return ToolResult(_unknown_device(args.source_device, ctx.topology))
+    if args.target_device not in ctx.topology.known_devices():
+        return ToolResult(_unknown_device(args.target_device, ctx.topology))
+    path = ctx.topology.path_trace(args.source_device, args.target_device)
     if not path:
         return ToolResult(
             f"Error: No physical path found between {args.source_device} and {args.target_device}. "
@@ -98,11 +112,11 @@ def handle_path_trace(
 
 
 def handle_blast_radius(
-    args: BlastRadiusInput, _state: dict[str, Any], topology: TopologyStore
+    args: BlastRadiusInput, _state: dict[str, Any], ctx: ToolContext
 ) -> ToolResult:
-    if args.device_name not in topology.known_devices():
-        return ToolResult(_unknown_device(args.device_name, topology))
-    impacts = topology.blast_radius(args.device_name)
+    if args.device_name not in ctx.topology.known_devices():
+        return ToolResult(_unknown_device(args.device_name, ctx.topology))
+    impacts = ctx.topology.blast_radius(args.device_name)
     if not impacts:
         return ToolResult(f"No downstream neighbors for {args.device_name}.")
     parts = [
@@ -112,13 +126,13 @@ def handle_blast_radius(
 
 
 def handle_security_boundary(
-    args: BoundaryInput, _state: dict[str, Any], topology: TopologyStore
+    args: BoundaryInput, _state: dict[str, Any], ctx: ToolContext
 ) -> ToolResult:
-    if args.source_device not in topology.known_devices():
-        return ToolResult(_unknown_device(args.source_device, topology))
-    if args.target_device not in topology.known_devices():
-        return ToolResult(_unknown_device(args.target_device, topology))
-    result = topology.security_boundary(args.source_device, args.target_device)
+    if args.source_device not in ctx.topology.known_devices():
+        return ToolResult(_unknown_device(args.source_device, ctx.topology))
+    if args.target_device not in ctx.topology.known_devices():
+        return ToolResult(_unknown_device(args.target_device, ctx.topology))
+    result = ctx.topology.security_boundary(args.source_device, args.target_device)
     if not result:
         return ToolResult(
             f"Error: missing zone membership for {args.source_device} or {args.target_device}."
@@ -131,7 +145,7 @@ def handle_security_boundary(
 
 
 def handle_delegate_firewall(
-    args: DelegateFirewallInput, state: dict[str, Any], _topology: TopologyStore
+    args: DelegateFirewallInput, state: dict[str, Any], ctx: ToolContext
 ) -> ToolResult:
     known = (state.get("topology_context") or "") + (state.get("zone_context") or "")
     if not known.strip():
@@ -154,7 +168,7 @@ def handle_delegate_firewall(
 
 
 def handle_resolve(
-    args: ResolveInput, _state: dict[str, Any], _topology: TopologyStore
+    args: ResolveInput, _state: dict[str, Any], ctx: ToolContext
 ) -> ToolResult:
     return ToolResult(
         content="Incident marked resolved.",
@@ -164,30 +178,44 @@ def handle_resolve(
 
 
 def handle_denied_flows(
-    args: DeniedFlowsInput, _state: dict[str, Any], _topology: TopologyStore
+    args: DeniedFlowsInput, _state: dict[str, Any], ctx: ToolContext
 ) -> ToolResult:
-    rows = firewall_mocks.denied_flows(args.source_device, args.target_device)
+    source_ip = ctx.topology.device_ip(args.source_device)
+    target_ip = ctx.topology.device_ip(args.target_device)
+    if not source_ip or not target_ip:
+        missing = args.source_device if not source_ip else args.target_device
+        return ToolResult(f"Error: no address known for {missing}; cannot query the firewall.")
+
+    query = FlowQuery(
+        source_device=args.source_device,
+        source_ip=source_ip,
+        target_device=args.target_device,
+        target_ip=target_ip,
+        port=args.port,
+    )
+    rows = ctx.firewall.denied_flows(query)
     if not rows:
         return ToolResult(
-            f"No denied flows between {args.source_device} and {args.target_device}."
+            f"No denied flows between {args.source_device} and {args.target_device} "
+            f"on port {args.port}."
         )
     return ToolResult(content=str(rows), state_update={"denied_flows": rows})
 
 
 def handle_acl_hits(
-    args: AclHitsInput, _state: dict[str, Any], _topology: TopologyStore
+    args: AclHitsInput, _state: dict[str, Any], ctx: ToolContext
 ) -> ToolResult:
-    rows = firewall_mocks.acl_hits(args.device_id, args.rule_id)
+    rows = ctx.firewall.acl_hits(args.device_id, args.rule_id)
     if not rows:
         return ToolResult(f"No ACL hits on {args.device_id}.")
     return ToolResult(content=str(rows))
 
 
 def handle_propose_change(
-    args: ProposeChangeInput, state: dict[str, Any], topology: TopologyStore
+    args: ProposeChangeInput, state: dict[str, Any], ctx: ToolContext
 ) -> ToolResult:
-    if args.device_id not in topology.known_devices():
-        return ToolResult(_unknown_device(args.device_id, topology))
+    if args.device_id not in ctx.topology.known_devices():
+        return ToolResult(_unknown_device(args.device_id, ctx.topology))
     action = {
         "device": args.device_id,
         "action": "add_acl_exception",
@@ -199,7 +227,7 @@ def handle_propose_change(
     # Simulate the change before a human is asked to approve it: an engineer
     # should never be shown a command that would not actually restore the flow.
     flows = list(state.get("denied_flows") or [])
-    report = verify_change([action], flows)
+    report = verify_change([action], flows, ctx.firewall)
     attempts = int(state.get("verify_attempts") or 0)
 
     if not report.ok and attempts < MAX_VERIFY_ATTEMPTS:
@@ -213,15 +241,34 @@ def handle_propose_change(
             state_update={"verify_attempts": attempts + 1, "verification": report.lines},
         )
 
-    action["verified"] = report.ok
-    action["verification"] = report.lines
-    status = "verified" if report.ok else "NOT VERIFIED after retries"
+    # Nothing should reach the gate without a reversal that has been shown to work.
+    rollback = verify_rollback(action, flows, ctx.firewall, args.rollback)
+    if not rollback.ok and attempts < MAX_VERIFY_ATTEMPTS:
+        return ToolResult(
+            content=(
+                "Change NOT queued. The rollback would not restore the previous state. "
+                + " ".join(rollback.lines)
+                + " "
+                + rollback.remediation
+            ),
+            state_update={"verify_attempts": attempts + 1, "verification": rollback.lines},
+        )
+
+    action["rollback"] = rollback.command
+    action["rollback_source"] = rollback.source
+    action["rollback_verified"] = rollback.ok
+    action["verified"] = report.ok and rollback.ok
+    action["verification"] = report.lines + rollback.lines
+    status = "verified" if action["verified"] else "NOT VERIFIED after retries"
     return ToolResult(
-        content=f"Proposed change queued for human approval ({status}).",
+        content=(
+            f"Proposed change queued for human approval ({status}). "
+            f"Rollback: {rollback.command}"
+        ),
         state_update={
             "pending_actions": [action],
             "findings_summary": args.rationale,
-            "verification": report.lines,
+            "verification": action["verification"],
         },
         goto="execute_change",
     )

@@ -62,6 +62,50 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e4b}
       OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-640}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_TTL_MINUTES: ${JWT_TTL_MINUTES:-60}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      SERVICE_TOKEN: ${SERVICE_TOKEN:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-10}
+      LOGIN_LOCK_THRESHOLD: ${LOGIN_LOCK_THRESHOLD:-5}
+      LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+      MFA_REQUIRED_FOR_APPROVERS: ${MFA_REQUIRED_FOR_APPROVERS:-true}
+      AUDIT_SIGNING_KEY: ${AUDIT_SIGNING_KEY:-}
+      AUDIT_RETIRED_KEYS: ${AUDIT_RETIRED_KEYS:-}
+      # Anchors live on their own volume: an anchor written to the database it
+      # is meant to police would prove nothing.
+      AUDIT_ANCHOR_FILE: ${AUDIT_ANCHOR_FILE:-/var/lib/zeronode/anchors.jsonl}
+      CHANGE_WINDOWS: ${CHANGE_WINDOWS:-}
+      CHANGE_FREEZES: ${CHANGE_FREEZES:-}
+      CHANGE_WINDOW_TZ: ${CHANGE_WINDOW_TZ:-UTC}
+      SECRET_CACHE_SECONDS: ${SECRET_CACHE_SECONDS:-300}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      REQUIRE_MANAGED_SECRETS: ${REQUIRE_MANAGED_SECRETS:-true}
+      # Compose brings the stores up first, so a failure here is a real failure.
+      STRICT_DEPENDENCIES: ${STRICT_DEPENDENCIES:-true}
+      FIREWALL_BACKEND: ${FIREWALL_BACKEND:-mock}
+      FIREWALL_HOST: ${FIREWALL_HOST:-}
+      FIREWALL_USERNAME: ${FIREWALL_USERNAME:-}
+      FIREWALL_PASSWORD: ${FIREWALL_PASSWORD:-}
+      FIREWALL_SECRET: ${FIREWALL_SECRET:-}
+      FIREWALL_ACL: ${FIREWALL_ACL:-}
+      FIREWALL_DEVICE_ID: ${FIREWALL_DEVICE_ID:-FW_Edge}
+    volumes:
+      - audit_anchors:/var/lib/zeronode
+    # /health fails while any store is degraded, so a container running on
+    # in-memory fixtures does not look healthy to anything watching.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request as r; r.urlopen('http://localhost:8000/health')\""
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -84,3 +128,4 @@ services:
 volumes:
   neo4j_data:
   pg_data:
+  audit_anchors:

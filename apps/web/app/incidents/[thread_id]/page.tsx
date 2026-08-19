@@ -5,11 +5,26 @@ import { useParams } from "next/navigation";
 import ApprovalGate from "@/components/ApprovalGate";
 import PathVisualizer from "@/components/PathVisualizer";
 import ReasoningTrace from "@/components/ReasoningTrace";
+import SessionBar from "@/components/SessionBar";
 import { useAgentState } from "@/hooks/useAgentState";
+import { useSession } from "@/hooks/useSession";
+import type { Session } from "@/lib/api";
+
+function blockedReason(session?: Session) {
+  if (!session || session.can_approve) return undefined;
+  if (session.kind === "service") {
+    return "Machine credentials cannot approve a change; sign in as a person.";
+  }
+  if (["approver", "admin"].includes(session.role) && !session.mfa) {
+    return "Approvals require a second factor. Enrol an authenticator, then sign in again.";
+  }
+  return "Your role cannot approve changes. An approver must sign this decision.";
+}
 
 export default function IncidentPage() {
   const params = useParams<{ thread_id: string }>();
   const threadId = params.thread_id;
+  const { session, signOut } = useSession();
   const { agentState, isError, isLoading, mutate } = useAgentState(threadId);
 
   return (
@@ -19,9 +34,12 @@ export default function IncidentPage() {
           <Link href="/dashboard">ZeroNode</Link>
           <span>{threadId}</span>
         </div>
-        <span className={`pill ${agentState?.status === "awaiting_approval" ? "wait" : ""}`}>
-          {agentState?.status ?? (isLoading ? "loading" : "unknown")}
-        </span>
+        <div className="topbar-right">
+          <span className={`pill ${agentState?.status === "awaiting_approval" ? "wait" : ""}`}>
+            {agentState?.status ?? (isLoading ? "loading" : "unknown")}
+          </span>
+          <SessionBar session={session} onSignOut={signOut} />
+        </div>
       </div>
       <h1>Incident {threadId}</h1>
       <p className="lede">
@@ -59,6 +77,12 @@ export default function IncidentPage() {
             <ApprovalGate
               threadId={threadId}
               proposedActions={agentState.proposed_actions ?? []}
+              canApprove={Boolean(session?.can_approve)}
+              blockedReason={blockedReason(session)}
+              actor={session?.email}
+              role={session?.role}
+              changeWindow={agentState.change_window}
+              alertFlags={agentState.alert_flags ?? []}
               onDone={() => mutate()}
             />
           ) : null}

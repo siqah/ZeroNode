@@ -1,42 +1,20 @@
-"""Post-change verification for proposed firewall policy.
+"""Simulate a proposed firewall change before a human is asked to approve it.
 
 A proposal is only useful if the flow it targets would actually pass afterwards.
-This module rebuilds the device ACL, splices the proposed rule in at its stated
-position, and re-evaluates the denied flow with first-match semantics. Order
-matters: a permit appended below an existing deny is shadowed and changes
-nothing, which is the mistake this check exists to catch.
+This module takes the device's current policy, splices the proposed rule in at
+its stated position, and re-evaluates the denied flow with first-match
+semantics. Two defects are caught: a permit shadowed by an earlier deny, which
+looks correct in a change ticket and does nothing on the device, and a permit
+that opens far more than the evidence justifies.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from ipaddress import IPv4Network, ip_address, ip_network
 from typing import Any
 
-from app.mocks.firewall import ACL_HITS
-
-PORT_ALIASES = {"https": 443, "http": 80, "ssh": 22, "domain": 53}
-LINE_RE = re.compile(r"\bline\s+(\d+)\b", re.IGNORECASE)
-LEADING_SEQ_RE = re.compile(r"^\s*(\d+)\s+")
-
-
-@dataclass
-class AclRule:
-    line: int
-    action: str
-    proto: str
-    src: str
-    dst: str
-    port: int | None
-    rule_id: str = "proposed"
-
-    def matches(self, src_ip: str, dst_ip: str, port: int, proto: str) -> bool:
-        if self.proto not in ("ip", "any", proto):
-            return False
-        if self.port is not None and self.port != port:
-            return False
-        return _contains(self.src, src_ip) and _contains(self.dst, dst_ip)
+from app.firewall.base import FirewallStore
+from app.firewall.policy import AclRule, breadth, evaluate_flow, parse_acl_command
 
 
 @dataclass
@@ -46,128 +24,7 @@ class VerificationReport:
     remediation: str = ""
 
 
-def _contains(spec: str, addr: str) -> bool:
-    if spec in ("any", "any4", "*"):
-        return True
-    try:
-        return ip_address(addr) in _as_network(spec)
-    except ValueError:
-        return False
-
-
-def _as_network(spec: str) -> IPv4Network:
-    return ip_network(spec if "/" in spec else f"{spec}/32", strict=False)
-
-
-def _parse_port(tokens: list[str], index: int) -> int | None:
-    if index < len(tokens) and tokens[index] == "eq" and index + 1 < len(tokens):
-        raw = tokens[index + 1]
-        if raw.isdigit():
-            return int(raw)
-        return PORT_ALIASES.get(raw)
-    return None
-
-
-def _parse_endpoint(tokens: list[str], index: int) -> tuple[str, int]:
-    """Return (spec, next_index) for host X | CIDR | dotted mask | any."""
-    token = tokens[index]
-    if token == "host" and index + 1 < len(tokens):
-        return tokens[index + 1], index + 2
-    if token in ("any", "any4"):
-        return "any", index + 1
-    if index + 1 < len(tokens) and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", tokens[index + 1]):
-        # "10.10.1.0 255.255.255.0" style
-        return f"{token}/{tokens[index + 1]}", index + 2
-    return token, index + 1
-
-
-def parse_acl_command(command: str) -> AclRule | None:
-    text = command.strip()
-    if not text:
-        return None
-    line_match = LINE_RE.search(text) or LEADING_SEQ_RE.match(text)
-    stated_line = int(line_match.group(1)) if line_match else None
-    text = LINE_RE.sub(" ", text)
-    tokens = text.replace("\t", " ").split()
-    tokens = [token.lower() for token in tokens]
-
-    action_index = next(
-        (i for i, token in enumerate(tokens) if token in ("permit", "deny")), None
-    )
-    if action_index is None:
-        return None
-    action = tokens[action_index]
-
-    index = action_index + 1
-    proto = "ip"
-    if index < len(tokens) and tokens[index] in ("tcp", "udp", "ip", "icmp"):
-        proto = tokens[index]
-        index += 1
-
-    try:
-        src, index = _parse_endpoint(tokens, index)
-        port = _parse_port(tokens, index)
-        if port is not None:
-            index += 2
-        dst, index = _parse_endpoint(tokens, index)
-    except IndexError:
-        return None
-
-    dst_port = _parse_port(tokens, index)
-    return AclRule(
-        line=stated_line if stated_line is not None else -1,
-        action=action,
-        proto=proto,
-        src=src,
-        dst=dst,
-        port=dst_port if dst_port is not None else port,
-    )
-
-
-def device_policy(device_id: str) -> list[AclRule]:
-    rules: list[AclRule] = []
-    for row in ACL_HITS:
-        if row.get("device") != device_id:
-            continue
-        rules.append(
-            AclRule(
-                line=int(row.get("line", 0)),
-                action=str(row.get("action", "deny")),
-                proto=str(row.get("proto", "tcp")),
-                src=str(row.get("src", "any")),
-                dst=str(row.get("dst", "any")),
-                port=row.get("port"),
-                rule_id=str(row.get("rule_id", "unknown")),
-            )
-        )
-    return sorted(rules, key=lambda rule: rule.line)
-
-
-def evaluate_flow(
-    rules: list[AclRule], src_ip: str, dst_ip: str, port: int, proto: str = "tcp"
-) -> tuple[str, AclRule | None]:
-    for rule in sorted(rules, key=lambda item: item.line):
-        if rule.matches(src_ip, dst_ip, port, proto):
-            return rule.action, rule
-    return "deny", None
-
-
-def _breadth(spec: str) -> int:
-    """Usable host count, excluding network and broadcast for real subnets."""
-    if spec in ("any", "any4", "*"):
-        return 2**32
-    try:
-        network = _as_network(spec)
-    except ValueError:
-        return 2**32
-    if network.prefixlen >= 31:
-        return network.num_addresses
-    return network.num_addresses - 2
-
-
-def scope_findings(
-    rule: AclRule, flows: list[dict[str, Any]]
-) -> tuple[list[str], str]:
+def scope_findings(rule: AclRule, flows: list[dict[str, Any]]) -> tuple[list[str], str]:
     """Flag a permit that opens far more than the evidence justifies.
 
     Widening a single blocked flow into subnet-to-subnet access is the quiet way
@@ -178,7 +35,7 @@ def scope_findings(
     if not srcs or not dsts:
         return [], ""
 
-    permitted = _breadth(rule.src) * _breadth(rule.dst)
+    permitted = breadth(rule.src) * breadth(rule.dst)
     needed = len(srcs) * len(dsts)
     lines: list[str] = []
     remediation = ""
@@ -202,8 +59,191 @@ def scope_findings(
     return lines, remediation
 
 
+@dataclass
+class RollbackReport:
+    ok: bool
+    command: str
+    source: str  # "model" when authored, "derived" when we produced it
+    lines: list[str]
+    remediation: str = ""
+
+
+def derive_rollback(command: str) -> str:
+    """The reversal of adding a line is removing it, which on Cisco is `no <line>`."""
+    text = (command or "").strip()
+    return text if text.lower().startswith("no ") else f"no {text}"
+
+
+def verify_rollback(
+    action: dict[str, Any],
+    flows: list[dict[str, Any]],
+    firewall: FirewallStore,
+    rollback: str = "",
+) -> RollbackReport:
+    """Check that the proposal can actually be undone.
+
+    A change nobody can reverse is not a change anyone should approve at two in
+    the morning, so the reversal is simulated with the same machinery as the
+    change: apply the proposal, apply the reversal, and require the flow to be
+    back where it started.
+    """
+    command = str(action.get("command", ""))
+    source = "model" if rollback.strip() else "derived"
+    reversal = rollback.strip() or derive_rollback(command)
+
+    device = str(action.get("device", ""))
+    proposed = parse_acl_command(command)
+    if proposed is None:
+        return RollbackReport(
+            False, reversal, source, [f"{device}: the proposed command does not parse."]
+        )
+
+    base = firewall.acl_policy(device)
+    position = action.get("position")
+    proposed.line = int(position) if position is not None else (
+        max((rule.line for rule in base), default=0) + 10
+    )
+    after_change = base + [proposed]
+
+    removal = _removal_target(reversal)
+    if removal is not None:
+        if not _same_rule(removal, proposed):
+            return RollbackReport(
+                False,
+                reversal,
+                source,
+                [
+                    f"ROLLBACK {device}: '{reversal}' removes a different rule than the one "
+                    f"being added."
+                ],
+                remediation=(
+                    "The rollback must remove exactly the line being added: "
+                    f"'{derive_rollback(command)}'."
+                ),
+            )
+        restored = base
+    else:
+        # Not a removal, so treat it as a compensating rule appended after the change.
+        compensating = parse_acl_command(reversal)
+        if compensating is None:
+            return RollbackReport(
+                False,
+                reversal,
+                source,
+                [f"ROLLBACK {device}: '{reversal}' does not parse as an ACL command."],
+                remediation=(
+                    f"Give the reversal as '{derive_rollback(command)}', or as an explicit "
+                    "rule that restores the previous behaviour."
+                ),
+            )
+        compensating.line = proposed.line - 1 if proposed.line > 1 else 1
+        restored = after_change + [compensating]
+
+    lines: list[str] = []
+    ok = True
+    for flow in flows:
+        src_ip = str(flow.get("src", ""))
+        dst_ip = str(flow.get("dst", ""))
+        port = int(flow.get("port", 0) or 0)
+        proto = str(flow.get("proto", "tcp"))
+        before, _ = evaluate_flow(base, src_ip, dst_ip, port, proto)
+        after, _ = evaluate_flow(restored, src_ip, dst_ip, port, proto)
+        flow_text = f"{src_ip} -> {dst_ip}:{port}/{proto}"
+        if before == after:
+            lines.append(f"ROLLBACK PASS {flow_text} returns to '{before}' after the reversal.")
+        else:
+            ok = False
+            lines.append(
+                f"ROLLBACK FAIL {flow_text} is '{after}' after the reversal but was "
+                f"'{before}' before the change."
+            )
+
+    remediation = (
+        ""
+        if ok
+        else (
+            "The reversal does not restore the previous behaviour. Use "
+            f"'{derive_rollback(command)}'."
+        )
+    )
+    return RollbackReport(
+        ok=ok, command=reversal, source=source, lines=lines, remediation=remediation
+    )
+
+
+def _removal_target(command: str) -> AclRule | None:
+    text = (command or "").strip()
+    if not text.lower().startswith("no "):
+        return None
+    return parse_acl_command(text[3:])
+
+
+def _same_rule(left: AclRule, right: AclRule) -> bool:
+    return (left.action, left.proto, left.src, left.dst, left.port) == (
+        right.action,
+        right.proto,
+        right.src,
+        right.dst,
+        right.port,
+    )
+
+
+def _nat_findings(
+    firewall: FirewallStore, device: str, flows: list[dict[str, Any]]
+) -> tuple[list[str], bool, str]:
+    """Report translation that would invalidate the simulation.
+
+    An ACL is matched against real addresses; the evidence may carry mapped
+    ones. Where a translation could touch the flow we say so and stop, rather
+    than producing a verdict that is confidently about the wrong packet.
+    """
+    assess = getattr(firewall, "nat_assessment", None)
+    if assess is None:
+        return [], False, ""
+
+    addresses = sorted(
+        {str(flow.get(key, "")) for flow in flows for key in ("src", "dst") if flow.get(key)}
+    )
+    if not addresses:
+        return [], False, ""
+
+    try:
+        assessment = assess(device, addresses)
+    except Exception:  # noqa: BLE001 - a backend without NAT support must not break verification
+        return [], False, ""
+
+    lines: list[str] = []
+    if assessment.unresolved:
+        lines.append(
+            f"NOTE {device} has {len(assessment.unresolved)} NAT rule(s) that could not be "
+            f"resolved: {assessment.unresolved}"
+        )
+    if not assessment.applies:
+        return lines, False, ""
+
+    lines.append(
+        f"INCONCLUSIVE {device} translates addresses on this flow: {assessment.translated}. "
+        "The ACL is evaluated against the real address, so this simulation cannot be trusted."
+    )
+    return (
+        lines,
+        True,
+        (
+            "Address translation applies to this flow. Confirm the real (untranslated) "
+            "addresses with a human before proposing an ACL change; the simulator will not "
+            "give a verdict while a translation is in play."
+        ),
+    )
+
+
+def _unmodelled_above(policy: list[AclRule], line: int) -> list[AclRule]:
+    return [rule for rule in policy if rule.action == "unparsed" and rule.line <= line]
+
+
 def verify_change(
-    actions: list[dict[str, Any]], flows: list[dict[str, Any]]
+    actions: list[dict[str, Any]],
+    flows: list[dict[str, Any]],
+    firewall: FirewallStore,
 ) -> VerificationReport:
     if not actions:
         return VerificationReport(False, ["No proposed action to verify."])
@@ -229,7 +269,13 @@ def verify_change(
             )
             continue
 
-        base = device_policy(device)
+        base = firewall.acl_policy(device)
+        nat_lines, nat_blocks, nat_fix = _nat_findings(firewall, device, flows)
+        lines.extend(nat_lines)
+        if nat_blocks:
+            ok = False
+            remediation = nat_fix
+
         position = action.get("position")
         if rule.line < 0 and position is not None:
             rule.line = int(position)
@@ -238,6 +284,21 @@ def verify_change(
             rule.line = max((item.line for item in base), default=0) + 10
             lines.append(
                 f"{device}: no position given, simulating append at line {rule.line}."
+            )
+
+        # A rule we could not model might match the flow first, so the simulation
+        # cannot be trusted to be complete.
+        blind = _unmodelled_above(base, rule.line)
+        if blind:
+            ok = False
+            lines.append(
+                f"INCONCLUSIVE {device} has {len(blind)} rule(s) above line {rule.line} "
+                f"that could not be modelled: {[item.raw for item in blind]}"
+            )
+            remediation = (
+                "The device policy contains rules this simulator cannot evaluate "
+                "(object-groups or unsupported syntax). A human must review the ACL "
+                "order manually before this change is applied."
             )
 
         matched_proposal = False

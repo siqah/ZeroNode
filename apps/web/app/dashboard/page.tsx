@@ -2,6 +2,9 @@
 
 import Link from "next/link";
 import useSWR from "swr";
+import MfaEnrolment from "@/components/MfaEnrolment";
+import SessionBar from "@/components/SessionBar";
+import { useSession } from "@/hooks/useSession";
 import { fetchIncidents, type IncidentRow } from "@/lib/api";
 
 function pillClass(status: string) {
@@ -12,10 +15,11 @@ function pillClass(status: string) {
 }
 
 export default function DashboardPage() {
+  const { session, signOut, unauthenticated } = useSession();
   const { data, error, isLoading } = useSWR<IncidentRow[]>(
-    "incidents",
+    unauthenticated ? null : "incidents",
     fetchIncidents,
-    { refreshInterval: 4000 }
+    { refreshInterval: 4000, shouldRetryOnError: false }
   );
   const incidents = data ?? [];
 
@@ -25,10 +29,14 @@ export default function DashboardPage() {
         <div className="brand">
           ZeroNode<span>NOC triage</span>
         </div>
-        <p className="muted">Dry-run HITL · cross-zone lab</p>
+        <div className="topbar-right">
+          <p className="muted">Dry-run HITL · cross-zone lab</p>
+          <SessionBar session={session} onSignOut={signOut} />
+        </div>
       </div>
       <h1>Active threads</h1>
       <p className="lede">Incidents pause at execute_change until an L3 engineer approves.</p>
+      <MfaEnrolment session={session} />
       {error ? (
         <p className="empty">
           Cannot reach API ({error instanceof Error ? error.message : "error"}). Start the

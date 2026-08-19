@@ -1,9 +1,25 @@
+# Keep secrets and local state out of the build context: anything here would be
+# readable in the image layers, not just during the build.
+.env
+.env.*
+!.env.example
+apps/web/.env
+apps/web/.env.*
+secrets/
+*.pem
+*.key
+.zeronode/
+*anchors*.jsonl
+
 .git
+.github
 **/.venv
 **/__pycache__
 **/node_modules
 **/.next
 **/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/*.egg-info
 *.md
-apps/web/.env.local
-.env
+docs

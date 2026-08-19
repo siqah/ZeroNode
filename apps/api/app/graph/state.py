@@ -20,8 +20,11 @@ class NetworkAgentState(TypedDict, total=False):
     verify_attempts: int
     topology_context: str
     zone_context: str
+    # What the alert text looked like it was trying to do, if anything.
+    alert_flags: list[str]
     reasoning_trace: Annotated[list[str], append_trace]
     tool_log: Annotated[list[str], append_trace]
     task_brief: str
     human_decision: str
     human_feedback: str
+    human_actor: str

@@ -8,6 +8,7 @@ from langgraph.graph import END
 from langgraph.types import Command
 from pydantic import ValidationError
 
+from app.firewall.base import FirewallStore
 from app.graph.parser import (
     ParsedToolCall,
     extract_thinking,
@@ -17,8 +18,9 @@ from app.graph.parser import (
 )
 from app.graph.prompts import FIREWALL_PROMPT, SUPERVISOR_PROMPT
 from app.graph.state import NetworkAgentState
+from app.sanitize import clean_device_output
 from app.store import TopologyStore
-from app.tools import FIREWALL_TOOLS, SUPERVISOR_TOOLS, ToolSpec
+from app.tools import FIREWALL_TOOLS, SUPERVISOR_TOOLS, ToolContext, ToolSpec
 from app.verify import verify_change
 
 
@@ -26,6 +28,11 @@ from app.verify import verify_change
 class AgentRuntime:
     llm: BaseChatModel
     topology: TopologyStore
+    firewall: FirewallStore
+
+    @property
+    def tool_context(self) -> ToolContext:
+        return ToolContext(topology=self.topology, firewall=self.firewall)
 
 
 def run_xml_turn(
@@ -141,7 +148,10 @@ def run_xml_turn(
         ]
         return Command(goto=default_goto, update=update)
 
-    result = spec.handler(args, dict(state), agent.topology)
+    result = spec.handler(args, dict(state), agent.tool_context)
+    # Tool output carries device text, and an ACL remark is somewhere an attacker
+    # with config access can leave a message for the model.
+    tool_content = clean_device_output(result.content)
     ai_with_call = AIMessage(
         content=content,
         tool_calls=[
@@ -158,7 +168,7 @@ def run_xml_turn(
         **result.state_update,
         "messages": [
             ai_with_call,
-            ToolMessage(content=result.content, tool_call_id="xml-1"),
+            ToolMessage(content=tool_content, tool_call_id="xml-1"),
         ],
         "tool_log": (update.get("tool_log") or []) + [f"{parsed.name}: {result.content}"],
     }
@@ -186,7 +196,8 @@ def _firewall_hint(state: NetworkAgentState) -> str:
     return (
         "Denied flows are known. NEXT REQUIRED ACTION: propose_policy_change on FW_Edge "
         "with the exact permit line. Use get_acl_hits to find the denying rule's line "
-        "number, then pass position=<line - 1> so the permit is evaluated first."
+        "number, then pass position=<line - 1> so the permit is evaluated first, and "
+        "rollback=\"no <that same permit line>\"."
     )
 
 
@@ -216,10 +227,12 @@ def firewall_node(state: NetworkAgentState, agent: AgentRuntime) -> Command:
     )
 
 
-def execute_change(state: NetworkAgentState) -> Command:
+def execute_change(state: NetworkAgentState, firewall: FirewallStore) -> Command:
     decision = (state.get("human_decision") or "").strip().lower()
     feedback = (state.get("human_feedback") or "").strip()
     actions = state.get("pending_actions") or []
+
+    actor = (state.get("human_actor") or "unattributed").strip()
 
     if decision == "reject":
         note = feedback or "no details"
@@ -229,7 +242,7 @@ def execute_change(state: NetworkAgentState) -> Command:
                 "messages": [
                     HumanMessage(
                         content=(
-                            f"Engineer REJECTED the change. Feedback: {note}. "
+                            f"Engineer {actor} REJECTED the change. Feedback: {note}. "
                             "Revise the proposal and call propose_policy_change again."
                         )
                     )
@@ -237,6 +250,7 @@ def execute_change(state: NetworkAgentState) -> Command:
                 "pending_actions": [],
                 "human_decision": "",
                 "human_feedback": "",
+                "human_actor": "",
                 "task_brief": f"Rejected. Engineer feedback: {note}",
             },
         )
@@ -245,12 +259,16 @@ def execute_change(state: NetworkAgentState) -> Command:
     commands = "\n".join(line for line in lines if line) or "(none)"
     # Re-run the simulation against the approved commands so the audit record
     # reflects what was signed off, not what was first proposed.
-    report = verify_change(actions, list(state.get("denied_flows") or []))
+    report = verify_change(actions, list(state.get("denied_flows") or []), firewall)
     verdict = "VERIFIED" if report.ok else "NOT VERIFIED"
+    reversals = "\n".join(
+        str(item.get("rollback", "")).strip() for item in actions if item.get("rollback")
+    )
     summary = (
-        f"DRY-RUN approved ({verdict}). Commands logged, not executed:\n"
+        f"DRY-RUN approved by {actor} ({verdict}). Commands logged, not executed:\n"
         + commands
         + (f"\nEngineer note: {feedback}" if feedback else "")
+        + (f"\nRollback:\n{reversals}" if reversals else "")
         + "\nVerification: "
         + " ".join(report.lines)
     )

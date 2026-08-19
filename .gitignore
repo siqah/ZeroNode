@@ -1,4 +1,28 @@
+# Secrets and local configuration
+# .env.example is the tracked template; the real file never leaves the machine.
 .env
+.env.*
+!.env.example
+apps/web/.env
+apps/web/.env.*
+!apps/web/.env.example
+secrets/
+*.secret
+
+# Private key material: ledger signing seeds, SSH keys, device certificates
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Local runtime state. The ledger anchor file is evidence, not source; the
+# default location is .zeronode/, but AUDIT_ANCHOR_FILE may point anywhere.
+.zeronode/
+*anchors*.jsonl
+
+# Python
 .venv/
 venv/
 __pycache__/
@@ -6,23 +30,30 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 *.egg-info/
 dist/
 build/
 
-# Neo4j runtime state (schema and seed Cypher are tracked)
-infra/neo4j/data/
-infra/neo4j/logs/
-infra/neo4j/import/
-infra/neo4j/plugins/
-
+# Node and Next.js
 node_modules/
 .next/
 out/
 *.tsbuildinfo
-apps/web/.env.local
 
+# Container and database runtime state. Schema and seed Cypher are tracked;
+# everything Neo4j writes at runtime is not.
+infra/neo4j/data/
+infra/neo4j/logs/
+infra/neo4j/import/
+infra/neo4j/plugins/
+infra/postgres/data/
+
+# Editors and operating systems
 .DS_Store
+Thumbs.db
 *.log
 .idea/
 .vscode/
+*.swp

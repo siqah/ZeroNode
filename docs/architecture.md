@@ -66,9 +66,9 @@ Just-in-time retrieval. The LLM sees short strings (`Web_App -> SW_DMZ -> FW_Edg
 
 ### Reliability — prove the loop before eval factories
 
-v0: one **golden incident** (cross-zone block) + deterministic mocks + a scripted-LLM test that asserts the graph pauses with a proposed action.
+v0: one **golden incident** (cross-zone block), a scripted-LLM test that asserts the graph pauses with a proposed action, and a policy suite run against captured device output so ACL semantics are verified without hardware in the loop.
 
-Later: Containerlab digital twin, Batfish control-plane proofs, LangSmith trajectory grades, Pass@K gates. Not in this slice.
+Later: Containerlab digital twin, Batfish control-plane proofs, LangSmith trajectory grades, Pass@K gates.
 
 ---
 
@@ -81,14 +81,14 @@ Later: Containerlab digital twin, Batfish control-plane proofs, LangSmith trajec
 ```
 Alert  →  Supervisor queries Neo4j (path + security boundary)
        →  crosses_boundary = true  →  handoff to firewall specialist
-       →  Specialist reads mocked denied flows / ACL hits
+       →  Specialist reads denied flows / ACL hits over the read-only firewall interface
        →  Specialist proposes an ACL exception
        →  Graph interrupts before execute_change
        →  L3 reviews diff in the dashboard (approve / reject + feedback)
        →  Approve: dry-run audit log. Reject: specialist re-plans.
 ```
 
-No SSH. No packets. No vendor APIs.
+Read-only throughout. Device sessions can issue `show` commands and nothing else; no configuration is written and no packets are generated.
 
 ### Roles that will use this
 
@@ -106,7 +106,7 @@ Alert / curl
         → LangGraph (Postgres checkpointer)
             → Ollama (host) for XML tool calls
             → Neo4j for path / blast radius / zone checks
-            → Mock firewall fixtures (denied flows, ACLs)
+            → FirewallStore (lab fixtures, or read-only Cisco ASA over SSH)
         → interrupt → Next.js HITL dashboard
 ```
 
@@ -127,8 +127,8 @@ Golden trigger: `{ "ticket_id": "INC-1001", "description": "Web_App cannot reach
 
 ## 6. Non-goals (v0)
 
-- Live SSH / NAPALM / pyATS against real boxes
-- Write-path execution (v0 dry-run only)
+- Write-path execution of any kind (v0 is dry-run; device sessions are read-only)
+- Multi-vendor device coverage beyond Cisco ASA reads
 - Slack / Teams ChatOps
 - Modal, Fargate, vLLM, AWQ, guided decoding
 - LangSmith / Containerlab / Batfish eval factory
@@ -137,11 +137,11 @@ Golden trigger: `{ "ticket_id": "INC-1001", "description": "Web_App cannot reach
 - Agent identity / PKI
 - 100k-device scale
 
-Those are phase-2. The moat starts when the HITL loop is demoable and auditable.
+Those are phase-2. The moat starts when the HITL loop is governed, reproducible, and auditable.
 
 ---
 
-## 7. What must be true for the demo
+## 7. Acceptance criteria for v0
 
 1. Seeded path `Web_App → SW_DMZ → FW_Edge → SW_TRUST → DB_Primary` with `DMZ` / `TRUST` zones.
 2. Supervisor calls topology tools before it may delegate.
@@ -149,4 +149,5 @@ Those are phase-2. The moat starts when the HITL loop is demoable and auditable.
 4. Graph pauses before any mutate node.
 5. Dashboard renders thinking, path, and diff.
 6. Approve logs dry-run; reject + feedback resumes the specialist.
-7. No packets. No SSH.
+7. Every proposed change is simulated against device policy before it reaches the gate.
+8. No writes: device access is read-only, and no code path can mutate a device.

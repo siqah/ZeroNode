@@ -1,5 +1,6 @@
 from langchain_core.messages import AIMessage, HumanMessage
 
+from app.firewall.mock import MockFirewall
 from app.graph.nodes import AgentRuntime, supervisor_node
 from app.store.memory import InMemoryTopology
 
@@ -27,6 +28,7 @@ def test_native_tool_call_is_executed_not_inferred():
             {"source_device": "Web_App", "target_device": "DB_Primary"},
         ),
         topology=InMemoryTopology(),
+        firewall=MockFirewall(),
     )
     state = {
         "messages": [HumanMessage(content="New Alert: Web_App cannot reach DB_Primary:443")],
