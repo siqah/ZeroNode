@@ -6,6 +6,7 @@ from app.execute.base import APPLIED, LOGGED, REFUSED, ROLLBACK_FAILED, ROLLED_B
 from app.execute.device import DeviceExecutor
 from app.execute.dryrun import DryRunExecutor
 from app.execute.guard import check, is_policy_command
+from app.execute.live import _same_rule
 from app.execute.session import FORBIDDEN, ConfigSession, UnsafeCommand
 from app.firewall.policy import AclRule, parse_acl_command
 
@@ -242,3 +243,54 @@ def test_the_screen_covers_the_obvious_ways_to_break_a_network():
     assert "reload" in FORBIDDEN
     assert "shutdown" in FORBIDDEN
     ConfigSession.screen([COMMAND, ROLLBACK])  # a policy change passes
+
+
+def test_srlinux_may_only_delete_one_numbered_ipv4_acl_entry():
+    ConfigSession.screen(
+        ["delete / acl acl-filter DMZ_TO_TRUST type ipv4 entry 30"]
+    )
+    with pytest.raises(UnsafeCommand):
+        ConfigSession.screen(["delete / interface ethernet-1/1"])
+
+
+def test_srlinux_configuration_is_committed_before_live_readback():
+    class Candidate:
+        def __init__(self):
+            self.commits = 0
+
+        def send_config_set(self, commands, read_timeout):
+            return "candidate changed\n"
+
+        def commit(self):
+            self.commits += 1
+            return "committed\n"
+
+    connection = Candidate()
+    session = ConfigSession(
+        "192.0.2.30",
+        "admin",
+        "password",
+        device_type="nokia_srl",
+    )
+    session._conn = connection
+
+    output = session.send_config(
+        ["set / acl acl-filter TEST type ipv4 entry 10 action accept"]
+    )
+
+    assert connection.commits == 1
+    assert output == "candidate changed\ncommitted\n"
+
+
+def test_live_verification_treats_a_host_and_its_32_prefix_as_the_same_rule():
+    expected = parse_acl_command(COMMAND)
+    assert expected is not None
+    read_back = AclRule(
+        line=30,
+        action="permit",
+        proto="tcp",
+        src="10.10.1.10/32",
+        dst="10.20.1.50/32",
+        port=443,
+    )
+    assert _same_rule(read_back, expected)

@@ -13,7 +13,7 @@ Product thesis: [docs/architecture.md](docs/architecture.md)
 - Every proposal carries a rollback command, and the rollback is simulated back to the pre-change verdict before the change can be queued
 - Approvals answer to a change window and freeze calendar; an admin can break glass, with a reason sealed into the approval record
 - Alert text is treated as untrusted input: control markers and hidden characters are stripped, it is fenced as data, and steering attempts are flagged to the approver
-- Firewall access sits behind a read-only interface with four backends: lab fixtures by default, plus Cisco ASA, Cisco IOS and Arista EOS over SSH. Read sessions can only issue `show` commands. Object-groups and named objects are resolved, and a translated flow makes the simulator decline a verdict instead of judging the wrong addresses
+- Firewall access sits behind a read-only interface with five backends: lab fixtures by default, plus Cisco ASA, Cisco IOS, Arista EOS and Nokia SR Linux over SSH. Read sessions can only issue `show` commands. Object-groups and named objects are resolved, and a translated flow makes the simulator decline a verdict instead of judging the wrong addresses
 - `python -m app.firewall.probe` validates a real device read-only and reports exactly which ACL lines the parser could not model
 - Approving a change requires an authenticated human with the `approver` role and a second factor; machine credentials can open incidents but can never approve one
 - Sessions are httpOnly cookies with CSRF protection, login is throttled, and repeated failures lock the account
@@ -133,7 +133,8 @@ cd apps/api && pip install -e ".[devices]"
 ```
 
 The probe reports how much of the policy the parser could model, whether NAT touches the flow, and
-that the read-only guard held. Then set `FIREWALL_BACKEND=cisco_asa`, `cisco_ios` or `arista_eos`.
+that the read-only guard held. Then set `FIREWALL_BACKEND=cisco_asa`, `cisco_ios`,
+`arista_eos` or `nokia_srl`.
 
 The device password may not be an inline value: point it at a secret manager, for example
 `FIREWALL_PASSWORD=file:/run/secrets/asa_password`, `vault:secret/data/zeronode#asa_password` or
@@ -175,9 +176,23 @@ docker compose --profile netbox up -d
 python scripts/ingest_netbox.py --token "$NETBOX_TOKEN" --dry-run
 ```
 
-The Containerlab topology is in `infra/containerlab/`. It requires a separately
-downloaded cEOS image. Network OS images are licensed artifacts and must never
-be committed; common image formats are ignored by Git and Docker.
+The Containerlab topology is in `infra/containerlab/`. It uses Nokia SR Linux,
+a genuine network OS whose official test image is public and requires no vendor
+account or licence download.
+
+```bash
+scripts/lab_containerlab_test.sh
+```
+
+The script pulls the pinned SR Linux image, boots the routed three-node lab,
+proves the seeded deny with a real packet, verifies a shadowed change is
+automatically rolled back, verifies a correctly positioned change passes, and
+destroys the lab.
+
+The script runs pinned Containerlab 0.78.2 through Docker, validates the topology,
+checks the read-only EOS adapter, sends a real TCP/443 packet through the
+three-node lab, proves apply and automatic rollback, restores the seeded policy
+and destroys the lab.
 
 ## Docker Compose (API + web)
 
@@ -217,6 +232,7 @@ scripts/golden_path.py    scripted end-to-end run, no Ollama needed
 scripts/e2e_walkthrough.py authenticated live-model walkthrough
 scripts/ingest_netbox.py  read NetBox topology into Neo4j
 scripts/lab_device_test.sh run SSH execution tests safely
+scripts/lab_containerlab_test.sh validate Phase 2 against Nokia SR Linux
 scripts/probe_turn.py     print the model's raw reply for one turn
 ```
 

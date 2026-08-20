@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.firewall.base import FirewallStore
-from app.firewall.policy import AclRule, evaluate_flow, parse_acl_command
+from app.firewall.policy import AclRule, as_network, evaluate_flow, parse_acl_command
 
 
 @dataclass
@@ -23,12 +23,19 @@ class LiveReport:
 
 
 def _same_rule(left: AclRule, right: AclRule) -> bool:
-    return (left.action, left.proto, left.src, left.dst, left.port) == (
-        right.action,
-        right.proto,
-        right.src,
-        right.dst,
-        right.port,
+    def same_endpoint(first: str, second: str) -> bool:
+        if first in ("any", "any4", "*") and second in ("any", "any4", "*"):
+            return True
+        try:
+            return as_network(first) == as_network(second)
+        except ValueError:
+            return first == second
+
+    return (
+        (left.action, left.proto, left.port)
+        == (right.action, right.proto, right.port)
+        and same_endpoint(left.src, right.src)
+        and same_endpoint(left.dst, right.dst)
     )
 
 

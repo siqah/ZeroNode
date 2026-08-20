@@ -13,6 +13,7 @@ and only for a device named in `EXECUTION_DEVICES`.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from app.firewall.ssh import Credential, SshDevice
@@ -35,6 +36,10 @@ FORBIDDEN = (
     "username",
     "aaa ",
     "crypto ",
+)
+SAFE_SRL_ACL_DELETE = re.compile(
+    r"^delete / acl acl-filter [A-Za-z0-9_.:-]+ type ipv4 entry \d+$",
+    re.IGNORECASE,
 )
 
 
@@ -74,6 +79,10 @@ class ConfigSession(SshDevice):
             lowered = command.lower()
             for word in FORBIDDEN:
                 if word in lowered:
+                    if word == "delete" and SAFE_SRL_ACL_DELETE.fullmatch(
+                        command.strip()
+                    ):
+                        continue
                     raise UnsafeCommand(f"refusing to send {command!r}: contains {word!r}")
 
     def send_config(self, commands: list[str]) -> str:
@@ -86,7 +95,12 @@ class ConfigSession(SshDevice):
             self.device_id,
             len(commands),
         )
-        return conn.send_config_set(commands, read_timeout=self.timeout)
+        output = conn.send_config_set(commands, read_timeout=self.timeout)
+        if self.device_type == "nokia_srl":
+            # SR Linux edits a private candidate. Without an explicit commit,
+            # read-back correctly sees no change and every execution rolls back.
+            output += conn.commit()
+        return output
 
     def read(self, command: str) -> str:
         """Read back through the same guard the read path uses."""

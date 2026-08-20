@@ -612,7 +612,7 @@ at the device now — together with the policy read back off it.
 | `AUDIT_SIGNING_KEY` | empty | Ed25519 seed for the ledger. Unset means an ephemeral key, so records cannot be verified after a restart |
 | `AUDIT_RETIRED_KEYS` | empty | Public keys of previous signing keys, comma separated, so records survive a rotation |
 | `AUDIT_ANCHOR_FILE` | empty | Where the chain head is anchored. Unset means deleting the ledger leaves no trace |
-| `FIREWALL_BACKEND` | `mock` | `mock`, `cisco_asa`, `cisco_ios` or `arista_eos`. The device backends need `pip install -e "apps/api[devices]"` |
+| `FIREWALL_BACKEND` | `mock` | `mock`, `cisco_asa`, `cisco_ios`, `arista_eos` or `nokia_srl`. The device backends need `pip install -e "apps/api[devices]"` |
 | `FIREWALL_HOST` / `FIREWALL_USERNAME` / `FIREWALL_PASSWORD` | empty | Read-only device credentials. The password must be a secret reference unless `REQUIRE_MANAGED_SECRETS` is off |
 | `FIREWALL_SECRET` | empty | Enable secret, only if `show` output needs privilege 15 |
 | `FIREWALL_ACL` | empty | Restricts `show access-list` to one ACL. Empty reads them all |
@@ -728,7 +728,7 @@ fixtures. Three rungs, each answering a question the one below it cannot:
 | L1 | Static fixtures and a seeded Neo4j graph | The state machine, the parsers and the simulator, deterministically and with no hardware | Running |
 | L2 | An SSH server shaped like a device, in Compose | That the client survives a real session, and that a change applied to something that actually changes is verified and undone correctly | Running |
 | L3 | NetBox as the source of truth | That the graph layer answers relational questions against a real inventory rather than a seed written to fit the queries | Built, unrun |
-| L4 | Containerlab with a real network OS | That a proposed diff maps onto real interface configuration, on a CLI nobody wrote for us | Built, needs an image |
+| L4 | Containerlab with a real network OS | That a proposed diff maps onto real interface configuration, on a CLI nobody wrote for us | Passed against Nokia SR Linux 24.10.4 |
 
 L1 is deliberately where the unit tests stay. Determinism is the point: a parser test that needs a
 container is a parser test people stop running. What L1 cannot do is tell you whether the client
@@ -776,28 +776,31 @@ answer delivered confidently. Zones come from a `security_zone` custom field or 
 
 **L4 — Containerlab** (`infra/containerlab/zeronode.clab.yml`). The cross-zone scenario as a real
 network: two hosts either side of a firewall, with the shadowing deny already in the startup
-config. The firewall is Arista EOS, for one unglamorous reason — it is the only credible network OS
-whose image anyone can obtain without a hardware or simulator licence. Cisco IOL and ASAv need CML
-or a Cisco account, and the topology takes either in place of the EOS node if you have one.
+config. The firewall is Nokia SR Linux: a genuine vendor NOS with an official public container
+image, so this rung is repeatable without hardware, a simulator licence or a vendor account.
 
 EOS is IOS-like, not IOS, so it has its own adapter (`app/firewall/eos.py`). The difference that
 matters is that EOS prints prefixes where IOS prints wildcard masks; reusing the IOS parser reads
 `10.10.1.0/24` as a single host and silently narrows every rule it touches.
 
-The image is not redistributable, so this rung needs one manual step:
+The image is not redistributable, so downloading it from the Arista software portal is the one
+manual step. Containerlab itself runs in a pinned container with the host PID namespace; no host
+installation or separate VM is required on this Intel Mac.
 
 ```bash
-# after downloading cEOS from arista.com
-docker import cEOS64-lab-4.32.2F.tar ceos:4.32.2F
-sudo clab deploy -t infra/containerlab/zeronode.clab.yml
-FIREWALL_BACKEND=arista_eos FIREWALL_HOST=172.20.20.11 python -m app.firewall.probe
+scripts/lab_containerlab_test.sh
 ```
 
-On macOS containerlab needs a Linux host, since it uses netlink and network namespaces directly:
-run it inside a VM (OrbStack, Colima or Lima), or dockerised with `--pid host` on Docker Desktop.
-Without `--pid host` the nodes come up unwired, which looks like a macOS limitation and is not. A
-Docker Desktop restart destroys the veth links, so redeploy with `--reconfigure` rather than
-restarting the containers.
+The validated sequence is read seeded deny → reject a shadowed change through
+live verification → automatic rollback → apply at the correct sequence → pass
+a real TCP/443 request → clean up and confirm the deny is restored.
+
+The harness validates and deploys the topology, waits for EOS SSH, proves the initial policy denies
+a real TCP/443 packet, applies a deliberately shadowed ACE and confirms automatic rollback, applies
+an effective ACE and confirms the packet crosses the firewall, restores the seeded deny, and
+destroys the topology. It publishes EOS SSH as `localhost:2223` because Docker Desktop does not
+route the Containerlab management subnet directly to macOS. The harness supplies `--pid host`; if
+that flag is omitted, nodes can come up unwired.
 
 One naming note to avoid confusion: these rungs are labelled L1–L4 because the numbered phases
 below already mean something different.

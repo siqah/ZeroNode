@@ -14,7 +14,7 @@ from app.secretref import SecretResolver, describe, is_managed
 
 logger = logging.getLogger(__name__)
 
-BACKENDS = ("mock", "cisco_asa", "cisco_ios")
+BACKENDS = ("mock", "cisco_asa", "cisco_ios", "arista_eos", "nokia_srl")
 
 
 def _resolver() -> SecretResolver:
@@ -121,4 +121,8 @@ def make_device_firewall(
         from app.firewall.eos import AristaEosFirewall
 
         return AristaEosFirewall(**kwargs)
+    if backend == "nokia_srl":
+        from app.firewall.srlinux import NokiaSrlinuxFirewall
+
+        return NokiaSrlinuxFirewall(**kwargs)
     raise RuntimeError(f"Unknown device backend: {backend!r}")

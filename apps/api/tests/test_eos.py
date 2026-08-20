@@ -116,7 +116,8 @@ def test_refresh_forces_a_second_read():
     assert len(eos.sent) == 2
 
 
-def test_eos_changes_are_rendered_the_ios_way():
-    """EOS sequences entries inside the ACL, as IOS does, not on the ACL line."""
+def test_eos_changes_enter_eos_acl_mode_and_sequence_the_entry():
     command = "ip access-list extended DMZ_TO_TRUST permit tcp host 10.10.1.10 host 10.20.1.50 eq 443"
-    assert device_commands(command, 39, "cisco_ios")[1].startswith("39 permit")
+    lines = device_commands(command, 39, "arista_eos")
+    assert lines[0] == "ip access-list DMZ_TO_TRUST"
+    assert lines[1].startswith("39 permit")

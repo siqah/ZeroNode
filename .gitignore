@@ -76,6 +76,7 @@ infra/netbox/media/
 # Network operating-system and packet-capture artifacts are licensed, large,
 # or contain real traffic. Track topology/config text, never the images.
 infra/containerlab/*.tar
+infra/containerlab/*.tar.*
 infra/containerlab/*.tgz
 infra/containerlab/*.qcow2
 infra/containerlab/*.img

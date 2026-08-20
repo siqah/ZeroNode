@@ -69,7 +69,10 @@ Just-in-time retrieval. The LLM sees short strings (`Web_App -> SW_DMZ -> FW_Edg
 
 v0: one **golden incident** (cross-zone block), a scripted-LLM test that asserts the graph pauses with a proposed action, a policy suite run against captured device output, and an SSH device emulator that exercises the real transport, config session, post-change verification and rollback without hardware.
 
-The NetBox ingest and Containerlab/cEOS topology are built as the next test rungs. They still need runs against populated NetBox and a real cEOS image. Later: Batfish control-plane proofs, trajectory grades and Pass@K gates.
+The NetBox ingest is the inventory test rung. The Containerlab rung has passed
+against Nokia SR Linux with live ACL read-back, real packet validation,
+position-sensitive application and automatic rollback. Later: Batfish
+control-plane proofs, trajectory grades and Pass@K gates.
 
 ---
 
@@ -109,7 +112,7 @@ Alert / curl
         → LangGraph (Postgres checkpointer)
             → Ollama (host) for XML tool calls
             → Neo4j for path / blast radius / zone checks
-            → FirewallStore (fixtures, Cisco ASA/IOS or Arista EOS read-only SSH)
+            → FirewallStore (fixtures, Cisco ASA/IOS, Arista EOS or Nokia SR Linux read-only SSH)
             → Executor (dry-run, or guarded device config + verification/rollback)
         → interrupt → Next.js HITL dashboard
         → signed approval ledger + optional ticket/notification webhooks

@@ -106,7 +106,11 @@ def probe(backend: str, device_id: str, flow: tuple[str, str, int] | None, **kwa
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Probe a device read-only")
-    parser.add_argument("--backend", default="cisco_asa", choices=["cisco_asa", "cisco_ios"])
+    parser.add_argument(
+        "--backend",
+        default="cisco_asa",
+        choices=["cisco_asa", "cisco_ios", "arista_eos", "nokia_srl"],
+    )
     parser.add_argument("--host", default="")
     parser.add_argument("--username", default="")
     parser.add_argument("--acl", default="", help="restrict to one access list")

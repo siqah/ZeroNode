@@ -17,9 +17,8 @@ class Settings(BaseSettings):
     neo4j_user: str = "neo4j"
     neo4j_password: str = "zeronode"
     database_url: str = "postgresql://zeronode:zeronode@localhost:5433/zeronode"
-    # Device access. "mock" uses fixtures; "cisco_asa" and "cisco_ios" open a
-    # read-only SSH session.
-    firewall_backend: str = "mock"  # mock | cisco_asa | cisco_ios | arista_eos
+    # Device access. "mock" uses fixtures; device backends open read-only SSH.
+    firewall_backend: str = "mock"  # mock | cisco_asa | cisco_ios | arista_eos | nokia_srl
     firewall_host: str = ""
     firewall_username: str = ""
     firewall_password: str = ""

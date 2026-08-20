@@ -1,0 +1,39 @@
+# Routed interfaces for the DMZ and TRUST hosts.
+set / interface ethernet-1/1 admin-state enable
+set / interface ethernet-1/1 description "to web (DMZ)"
+set / interface ethernet-1/1 subinterface 0 admin-state enable
+set / interface ethernet-1/1 subinterface 0 ipv4 admin-state enable
+set / interface ethernet-1/1 subinterface 0 ipv4 address 10.10.1.1/24
+set / interface ethernet-1/2 admin-state enable
+set / interface ethernet-1/2 description "to db (TRUST)"
+set / interface ethernet-1/2 subinterface 0 admin-state enable
+set / interface ethernet-1/2 subinterface 0 ipv4 admin-state enable
+set / interface ethernet-1/2 subinterface 0 ipv4 address 10.20.1.1/24
+set / network-instance default interface ethernet-1/1.0
+set / network-instance default interface ethernet-1/2.0
+
+# The seeded deny reproduces the incident. A permit appended after entry 40 is
+# deliberately shadowed; a permit inserted at entry 30 fixes the real flow.
+set / acl acl-filter DMZ_TO_TRUST type ipv4 statistics-per-entry true
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 10 match ipv4 protocol tcp
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 10 match ipv4 source-ip prefix 10.10.1.0/24
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 10 match ipv4 destination-ip prefix 10.20.1.0/24
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 10 match transport destination-port value 80
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 10 action accept
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 20 match ipv4 protocol tcp
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 20 match ipv4 source-ip prefix 10.10.1.20/32
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 20 match ipv4 destination-ip prefix 10.20.1.50/32
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 20 match transport destination-port value 1521
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 20 action accept
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 40 match ipv4 protocol tcp
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 40 match ipv4 source-ip prefix 10.10.1.0/24
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 40 match ipv4 destination-ip prefix 10.20.1.50/32
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 40 match transport destination-port value 443
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 40 action drop
+set / acl acl-filter DMZ_TO_TRUST type ipv4 entry 50 action drop
+
+# ACL attachment is intentionally explicit: SR Linux separates filter
+# definition from the subinterface reference and direction.
+set / acl interface ethernet-1/1.0 interface-ref interface ethernet-1/1
+set / acl interface ethernet-1/1.0 interface-ref subinterface 0
+set / acl interface ethernet-1/1.0 input acl-filter DMZ_TO_TRUST type ipv4

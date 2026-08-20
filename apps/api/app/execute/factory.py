@@ -12,7 +12,12 @@ from app.config import settings
 from app.execute.session import ConfigSession
 from app.firewall.devices import _credential, _resolver
 
-DEVICE_TYPES = {"cisco_asa": "cisco_asa", "cisco_ios": "cisco_ios", "arista_eos": "arista_eos"}
+DEVICE_TYPES = {
+    "cisco_asa": "cisco_asa",
+    "cisco_ios": "cisco_ios",
+    "arista_eos": "arista_eos",
+    "nokia_srl": "nokia_srl",
+}
 
 
 def session_factory(backend: str) -> Callable[[str], ConfigSession]:

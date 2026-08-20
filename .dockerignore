@@ -50,6 +50,7 @@ infra/**/data
 infra/**/logs
 infra/**/media
 infra/containerlab/*.tar
+infra/containerlab/*.tar.*
 infra/containerlab/*.tgz
 infra/containerlab/*.qcow2
 infra/containerlab/*.img
