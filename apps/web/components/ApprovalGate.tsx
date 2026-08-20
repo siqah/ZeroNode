@@ -17,6 +17,7 @@ export default function ApprovalGate({
   role,
   changeWindow,
   alertFlags = [],
+  executionMode = "",
   onDone,
 }: {
   threadId: string;
@@ -27,6 +28,7 @@ export default function ApprovalGate({
   role?: string;
   changeWindow?: ChangeWindow;
   alertFlags?: string[];
+  executionMode?: string;
   onDone: () => void;
 }) {
   const [feedback, setFeedback] = useState("");
@@ -38,6 +40,9 @@ export default function ApprovalGate({
   const action = proposedActions[0];
   const windowClosed = changeWindow ? !changeWindow.open : false;
   const canOverride = role === "admin";
+  // The single most important thing on this screen: whether pressing approve
+  // writes to hardware. Never inferred from a default — the API says which.
+  const willWrite = executionMode.startsWith("live execution");
 
   const handleDecision = async (decision: "approve" | "reject") => {
     setBusy(true);
@@ -60,6 +65,20 @@ export default function ApprovalGate({
   return (
     <div className="gate">
       <h3>Action required: approve configuration</h3>
+
+      <div className={willWrite ? "verdict fail" : "notice"}>
+        <strong>
+          {willWrite
+            ? "Approving will write this to the live device."
+            : "Approving records the change; nothing will be sent to a device."}
+        </strong>
+        {willWrite ? (
+          <p className="muted">
+            {executionMode}. If the change does not verify against the device afterwards, it
+            is rolled back automatically.
+          </p>
+        ) : null}
+      </div>
 
       {alertFlags.length ? (
         <div className="notice">
@@ -166,7 +185,13 @@ export default function ApprovalGate({
           }
           onClick={() => handleDecision("approve")}
         >
-          {windowClosed ? "Override window & dry-run" : "Execute dry-run"}
+          {windowClosed
+            ? willWrite
+              ? "Override window & apply"
+              : "Override window & dry-run"
+            : willWrite
+              ? "Apply to device"
+              : "Execute dry-run"}
         </button>
       </div>
     </div>

@@ -267,6 +267,9 @@ class CiscoIosFirewall(SshDevice):
     def describe(self) -> str:
         return f"cisco-ios {self.host} (read-only)"
 
+    def refresh(self, device_id: str) -> None:
+        self._cache.pop(device_id, None)
+
     def _policy_result(self, device_id: str, refresh: bool = False) -> AclParseResult:
         if refresh or device_id not in self._cache:
             command = "show ip access-lists"

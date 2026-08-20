@@ -78,6 +78,14 @@ services:
       # Anchors live on their own volume: an anchor written to the database it
       # is meant to police would prove nothing.
       AUDIT_ANCHOR_FILE: ${AUDIT_ANCHOR_FILE:-/var/lib/zeronode/anchors.jsonl}
+      EXECUTION_ENABLED: ${EXECUTION_ENABLED:-false}
+      EXECUTION_DEVICES: ${EXECUTION_DEVICES:-}
+      EXECUTION_AUTO_ROLLBACK: ${EXECUTION_AUTO_ROLLBACK:-true}
+      TICKET_WEBHOOK_URL: ${TICKET_WEBHOOK_URL:-}
+      TICKET_WEBHOOK_TOKEN: ${TICKET_WEBHOOK_TOKEN:-}
+      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
+      NOTIFY_WEBHOOK_TOKEN: ${NOTIFY_WEBHOOK_TOKEN:-}
+      DASHBOARD_URL: ${DASHBOARD_URL:-http://localhost:3000}
       CHANGE_WINDOWS: ${CHANGE_WINDOWS:-}
       CHANGE_FREEZES: ${CHANGE_FREEZES:-}
       CHANGE_WINDOW_TZ: ${CHANGE_WINDOW_TZ:-UTC}
@@ -125,7 +133,64 @@ services:
     depends_on:
       - api
 
+  # NetBox as a source of truth, so the graph comes from an inventory rather
+  # than a seed written to fit the queries. Heavy: expect ~3 GB of images.
+  #   docker compose --profile netbox up -d
+  #   python scripts/ingest_netbox.py --token <api-token> --replace
+  netbox-postgres:
+    image: postgres:16
+    container_name: zeronode-netbox-db
+    profiles: ["netbox"]
+    environment:
+      POSTGRES_DB: netbox
+      POSTGRES_USER: netbox
+      POSTGRES_PASSWORD: netbox
+    volumes:
+      - netbox_db:/var/lib/postgresql/data
+
+  netbox-redis:
+    image: redis:7-alpine
+    container_name: zeronode-netbox-redis
+    profiles: ["netbox"]
+
+  netbox:
+    image: netboxcommunity/netbox:v4.1-3.0.2
+    container_name: zeronode-netbox
+    profiles: ["netbox"]
+    depends_on: [netbox-postgres, netbox-redis]
+    environment:
+      DB_HOST: netbox-postgres
+      DB_NAME: netbox
+      DB_USER: netbox
+      DB_PASSWORD: netbox
+      REDIS_HOST: netbox-redis
+      REDIS_DATABASE: "0"
+      REDIS_CACHE_HOST: netbox-redis
+      REDIS_CACHE_DATABASE: "1"
+      SECRET_KEY: ${NETBOX_SECRET_KEY:-}
+      SUPERUSER_NAME: ${NETBOX_USER:-admin}
+      SUPERUSER_PASSWORD: ${NETBOX_PASSWORD:-}
+      SUPERUSER_API_TOKEN: ${NETBOX_TOKEN:-}
+      ALLOWED_HOSTS: "*"
+    ports:
+      - "8000:8080"
+    volumes:
+      - netbox_media:/opt/netbox/netbox/media
+
+  # A device-shaped SSH server for testing the client against something that
+  # changes when you configure it. Not in the default stack: start it with
+  #   docker compose --profile lab up -d fake-asa
+  fake-asa:
+    build: ./infra/fakeasa
+    container_name: zeronode-fake-asa
+    profiles: ["lab"]
+    ports:
+      - "2222:2222"
+    command: ["python", "server.py", "--port", "2222", "--username", "netops", "--password", "zeronode"]
+
 volumes:
   neo4j_data:
   pg_data:
   audit_anchors:
+  netbox_db:
+  netbox_media:

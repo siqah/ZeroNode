@@ -7,19 +7,24 @@ from psycopg.rows import dict_row
 
 from app.auth.models import Role
 
-CREATE_USERS = """
-CREATE TABLE IF NOT EXISTS users (
-    email TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL,
-    active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT NOT NULL DEFAULT '';
-ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
-"""
+# One statement per entry. The pool prepares every statement, and a prepared
+# statement cannot carry more than one command, so a single script would fail
+# on a pooled connection while working on a plain one.
+CREATE_USERS = (
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        email TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ",
+)
 
 USER_COLUMNS = (
     "email, password_hash, role, active, totp_secret, totp_enabled, "
@@ -28,7 +33,8 @@ USER_COLUMNS = (
 
 
 async def ensure_users_table(conn: psycopg.AsyncConnection) -> None:
-    await conn.execute(CREATE_USERS)
+    for statement in CREATE_USERS:
+        await conn.execute(statement)
 
 
 async def get_user(conn: psycopg.AsyncConnection, email: str) -> dict[str, Any] | None:

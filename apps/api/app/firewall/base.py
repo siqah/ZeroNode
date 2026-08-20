@@ -41,6 +41,14 @@ class FirewallStore(Protocol):
         """Rule hit counters, optionally filtered to one rule."""
         ...
 
+    def refresh(self, device_id: str) -> None:
+        """Drop any cached policy for the device.
+
+        Post-change verification is worthless against a cached read, so a
+        backend that caches must be able to forget on demand.
+        """
+        ...
+
     def nat_assessment(self, device_id: str, addresses: list[str]) -> NatAssessment:
         """Whether address translation could apply to the given addresses.
 

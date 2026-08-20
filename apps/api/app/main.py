@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
+import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any
 
+from email_validator import EmailNotValidError, validate_email
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_ollama import ChatOllama
@@ -18,8 +21,10 @@ from app.auth.models import Role
 from app.auth.passwords import hash_password
 from app.auth.ratelimit import SlidingWindow
 from app.config import cypher_dir, settings
+from app.execute import make_executor
 from app.firewall.mock import MockFirewall
 from app.graph.builder import build_graph
+from app.outbound import make_notifier, make_ticket_sink
 from app.routers.audit import router as audit_router
 from app.routers.auth import router as auth_router
 from app.routers.incidents import router as incidents_router
@@ -31,15 +36,21 @@ from app.store.memory import InMemoryTopology
 logger = logging.getLogger(__name__)
 
 
-def _check_ollama() -> None:
-    import urllib.request
-
+def _ollama_status() -> tuple[bool, str]:
     url = settings.ollama_base_url.rstrip("/") + "/api/tags"
     try:
         with urllib.request.urlopen(url, timeout=5):
-            logger.info("Ollama reachable at %s", settings.ollama_base_url)
+            return True, f"{settings.ollama_model} at {settings.ollama_base_url}"
     except Exception as exc:
-        logger.error("Ollama unreachable at %s (%s)", settings.ollama_base_url, exc)
+        return False, f"unreachable at {settings.ollama_base_url} ({exc})"
+
+
+def _check_ollama() -> None:
+    reachable, detail = _ollama_status()
+    if reachable:
+        logger.info("Ollama reachable: %s", detail)
+    else:
+        logger.error("Ollama %s", detail)
 
 
 def _make_llm():
@@ -161,6 +172,19 @@ async def _bootstrap_admin(app: FastAPI, pool) -> None:
     if created:
         logger.info("Bootstrapped admin user %s", email)
 
+    # The login endpoint validates the address, and this does not go through it.
+    # A reserved domain such as .local creates an account that can never be used,
+    # which is only discovered at the first login attempt.
+    try:
+        validate_email(email, check_deliverability=False)
+    except EmailNotValidError as exc:
+        logger.error(
+            "BOOTSTRAP_ADMIN_EMAIL %s is not an address the login endpoint accepts "
+            "(%s); this account cannot be logged into.",
+            email,
+            exc,
+        )
+
 
 def make_topology(strict: bool, resolver: SecretResolver) -> tuple[Any, str]:
     """Returns (store, degradation). A degradation is empty when all is well.
@@ -240,6 +264,12 @@ async def lifespan(app: FastAPI):
 
     firewall = _make_firewall()
     logger.info("Firewall backend: %s", firewall.describe())
+    executor = make_executor(firewall)
+    logger.info("Execution mode: %s", executor.describe())
+    app.state.tickets = make_ticket_sink()
+    app.state.notifier = make_notifier()
+    logger.info("Ticketing: %s", app.state.tickets.describe())
+    logger.info("Notifications: %s", app.state.notifier.describe())
     _check_ollama()
     llm = _make_llm()
 
@@ -255,7 +285,7 @@ async def lifespan(app: FastAPI):
         await checkpointer.setup()
 
     app.state.pool = pool
-    graph = build_graph(llm, topology, checkpointer, firewall)
+    graph = build_graph(llm, topology, checkpointer, firewall, executor)
 
     if pool is not None:
         await _bootstrap_admin(app, pool)
@@ -286,7 +316,9 @@ async def lifespan(app: FastAPI):
     app.state.graph = graph
     app.state.topology = topology
     app.state.firewall = firewall
+    app.state.executor = executor
     app.state.memory_incidents = {}
+    app.state.graph_failures = {}
     yield
     if pool is not None:
         await pool.close()
@@ -318,7 +350,10 @@ async def health(response: Response):
     goes missing without anybody noticing. Any degradation makes this endpoint
     fail, so an orchestrator or a monitor sees it.
     """
-    degradations = getattr(app.state, "degradations", [])
+    degradations = list(getattr(app.state, "degradations", []))
+    ollama_ok, ollama_detail = await asyncio.to_thread(_ollama_status)
+    if not ollama_ok:
+        degradations.append(f"Ollama {ollama_detail}")
     if degradations:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
@@ -331,6 +366,16 @@ async def health(response: Response):
             if getattr(app.state, "firewall", None)
             else "unset",
             "auth": "enabled" if settings.auth_enabled else "disabled",
+            "inference": ollama_detail,
+            "execution": app.state.executor.describe()
+            if getattr(app.state, "executor", None)
+            else "unset",
+            "tickets": app.state.tickets.describe()
+            if getattr(app.state, "tickets", None)
+            else "unset",
+            "notifications": app.state.notifier.describe()
+            if getattr(app.state, "notifier", None)
+            else "unset",
             "change_window": app.state.schedule.describe()
             if getattr(app.state, "schedule", None)
             else "unset",

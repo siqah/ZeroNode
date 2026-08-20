@@ -1,0 +1,48 @@
+# The cross-zone scenario as a real network.
+#
+#   web (DMZ, 10.10.1.10) --- fw (Arista EOS) --- db (TRUST, 10.20.1.50)
+#
+# The firewall is the only node ZeroNode talks to; the hosts exist so that the
+# flow the alert describes can actually be attempted and observed, rather than
+# only reasoned about.
+#
+# The cEOS image is not redistributable. Download it from arista.com (a free
+# account is enough), then:
+#
+#   docker import cEOS64-lab-4.32.2F.tar ceos:4.32.2F
+#   sudo clab deploy -t infra/containerlab/zeronode.clab.yml
+#
+# On macOS, containerlab needs a Linux host: run it inside a VM (OrbStack,
+# Colima or Lima), or dockerised with --pid host on Docker Desktop. A Docker
+# Desktop restart destroys the veth links, so redeploy with --reconfigure
+# rather than restarting the containers.
+
+name: zeronode
+
+topology:
+  nodes:
+    fw:
+      kind: arista_ceos
+      image: ceos:4.32.2F
+      startup-config: fw.cfg
+      mgmt-ipv4: 172.20.20.11
+
+    web:
+      kind: linux
+      image: alpine:3.20
+      exec:
+        - ip addr add 10.10.1.10/24 dev eth1
+        - ip link set eth1 up
+        - ip route add 10.20.1.0/24 via 10.10.1.1
+
+    db:
+      kind: linux
+      image: alpine:3.20
+      exec:
+        - ip addr add 10.20.1.50/24 dev eth1
+        - ip link set eth1 up
+        - ip route add 10.10.1.0/24 via 10.20.1.1
+
+  links:
+    - endpoints: ["web:eth1", "fw:eth1"]
+    - endpoints: ["db:eth1", "fw:eth2"]

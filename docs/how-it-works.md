@@ -3,7 +3,9 @@
 ZeroNode turns a network alert into a reviewed, evidence-backed configuration change. A local
 LLM drives the investigation, but it never touches a device: every fact it uses comes from a
 deterministic tool, every change it proposes is simulated before a human sees it, and approval
-only ever logs a dry run.
+logs a dry run unless someone has deliberately enabled execution for a named device — in which
+case the change is verified against the device afterwards and rolled back automatically if it did
+not do what it promised.
 
 This document explains the running system as it exists today, then lists what is still missing
 before it could be trusted in production. For the product thesis and the four pillars, see
@@ -65,10 +67,13 @@ Everything runs on one machine. No telemetry leaves it, and the model is local.
    authenticated human holding the `approver` role. The decision, the actor and the evidence they
    were shown are sealed into the approval ledger *before* the graph resumes with
    `Command(resume=True, update={...})`. Resuming an incident that is not paused returns `409`.
-6. **Record.** On approve, `execute_change` re-runs the simulation and writes a `DRY-RUN approved
-   by <actor> (VERIFIED|NOT VERIFIED)` summary. On reject, the engineer's feedback is injected as
-   a message and control returns to the specialist to revise. The caller gets a receipt carrying
-   the ledger hash.
+6. **Act.** On approve, `execute_change` re-runs the simulation against what was actually signed
+   off, then hands the change to the executor. By default that logs it; with execution enabled for
+   the device it is sent, read back, and reversed if the read-back disagrees. On reject, the
+   engineer's feedback is injected as a message and control returns to the specialist to revise.
+   The caller gets a receipt carrying the ledger hash.
+7. **Record.** What execution did is sealed into the same chain as the approval, written back to
+   the ticket, and — for a refusal or a failed rollback — notified.
 
 ---
 
@@ -102,6 +107,7 @@ worst bug in the project's history.
 | `denied_flows` | Structured deny records from the firewall, used by the simulator |
 | `pending_actions` | The change waiting at the gate, with its verification verdict |
 | `verification` | Simulator output lines shown in the UI |
+| `execution` | What execution did: mode, terminal state, commands, and what the device said back |
 | `verify_attempts` | Correction budget, capped at 3 |
 | `alert_flags` | What the incoming alert text looked like it was trying to do, if anything |
 | `reasoning_trace` / `tool_log` | Append-only audit of decisions and raw tool output |
@@ -189,7 +195,8 @@ change by deleting a line.
 
 The point is narrow and worth stating: this proves the reversal is the correct inverse of the
 change, not that pasting it at three in the morning will fix a broken network. Anything else the
-change disturbed is out of scope until execution is real.
+change disturbed is out of scope. It is also what makes the automatic rollback in section 9
+defensible: the reversal being sent after a failed check is one that was already simulated.
 
 The simulation runs **at proposal time**, so a change that fails is never shown to a human — the
 model gets the failure and revises, up to three attempts. It runs **again after approval** so the
@@ -199,7 +206,95 @@ asking a human to look.
 
 ---
 
-## 9. Identity, roles and the approval ledger
+## 9. Executing a change
+
+Everything up to this point is reversible because nothing has happened yet. This section is the
+part that can break a network, so it is built to refuse rather than to act.
+
+### Two switches, not one
+
+`EXECUTION_ENABLED` turns the capability on. `EXECUTION_DEVICES` names the devices it may touch.
+Neither does anything alone, and an empty device list means every approval stays a dry run no
+matter what the first flag says. This is deliberate: enabling a feature is a deployment decision,
+choosing which hardware it reaches is a change-management one, and collapsing the two is how a
+flag set in a lab ends up pointed at production. Default is dry-run, which is also the correct
+permanent setting for any environment where a wrong command costs more than a manual paste.
+
+### One file can write
+
+The read path enforces its guarantee in the transport: `SshDevice._send` raises
+`ReadOnlyViolation` for anything that is not a `show`, and execution does not relax it. A separate
+class, `ConfigSession` in `app/execute/session.py`, is the only code in the repository that can
+send configuration. "Can this change a device?" is therefore answered by which class was
+constructed, not by reading a method for a flag, and the answer for every backend, tool and query
+path remains no.
+
+### What has to be true before anything is sent
+
+Approval is necessary and not sufficient. `app/execute/guard.py` re-checks, at execution time, the
+properties the human's decision depended on:
+
+| Precondition | Why it is checked again |
+| --- | --- |
+| The change passed simulation | An approval of an unverified change is an approval of a guess |
+| A verified rollback exists | Anything sent must be undoable by the same machinery that sent it |
+| Every command parses as an ACL line | If the simulator could not model it, nobody has demonstrated what it does |
+| The device is in `EXECUTION_DEVICES` | Approval says what, configuration says where |
+| Denied-flow evidence exists | Without it there is nothing to verify against afterwards |
+
+A refusal is a terminal state with reasons, not an exception. It is reported at the gate, written
+to the ticket, and notified, because an approval that quietly did nothing is worse than one that
+visibly failed.
+
+### Verifying against the device, not against the model
+
+The simulator answered "would this work" against policy read *before* the change. Post-change
+verification answers "did it work" against policy read *after* it, with the backend cache dropped
+first — a stale read verifies nothing. Two things have to hold: the rule is actually present in
+the policy read back, and the flow now evaluates to `permit`.
+
+The interesting failure is a device that accepts a command and changes nothing. It is a normal
+occurrence — a line rejected by an object-group reference, an ACL applied to a different
+interface, a platform quirk — and it is invisible to anything that only checks whether the command
+returned without error. Simulation and device disagreeing is the signal worth having, because it
+means the model of the device is wrong somewhere.
+
+### Undoing it
+
+A failed check triggers the rollback immediately, followed by a second read to confirm the flow is
+back where it started. Three outcomes, and the names are the ones used everywhere in the system:
+
+- `applied` — on the device and confirmed.
+- `rolled_back` — applied, failed its check, reversed, and confirmed reversed.
+- `rollback_failed` — the device is in a state nobody chose. This is loud on purpose: it is logged
+  as an error, sealed into the ledger, commented onto the ticket, sent to the notification webhook
+  and shown at the top of the incident page. It is the one outcome that requires a person to go and
+  look now, so nothing about it is quiet.
+
+One session serves the change and its reversal, and it is closed whatever happens. A device has a
+finite number of VTY lines, and a rollback that cannot connect because the failed change is still
+holding the session is the worst possible time to find that out.
+
+The change is left in the running configuration and is **not** written to startup. That is a
+choice, not an omission: an unsaved change is one a reload undoes, which is a useful last resort
+while execution is new. It also means a device that reboots loses the fix, so the ticket is where
+the durable record lives until someone saves it deliberately.
+
+The same reversal path runs when a command fails part-way through a multi-line change, which is
+when it matters most. `EXECUTION_AUTO_ROLLBACK=false` exists for operators who would rather
+inspect a broken change than have it removed underneath them; it produces `rollback_failed` with
+an explicit note that reversal was disabled.
+
+### In the audit trail
+
+The approval record says what a person agreed to. A second record, `execution:<state>`, says what
+the system then did with it, in the same hash chain. Recording only the first would leave the more
+consequential half outside the audit trail. Dry runs are not recorded twice, since the approval
+already describes them completely.
+
+---
+
+## 10. Identity, roles and the approval ledger
 
 Approving a firewall change is the one privileged action in the system, so it is the one the
 security model is built around.
@@ -317,7 +412,7 @@ approve anything — and no second-person rule for high-blast-radius changes.
 
 ---
 
-## 10. Untrusted input
+## 11. Untrusted input
 
 Everything the agent reads from outside is attacker-influenced. A webhook body can be forged or
 replayed, and a device configuration can carry an ACL remark written by whoever last had config
@@ -352,7 +447,7 @@ investigation. It cannot widen a rule on its own.
 
 ---
 
-## 11. Data stores
+## 12. Data stores
 
 - **Neo4j** holds the topology: `Device`, `Interface`, `SecurityZone`, and the `CONNECTS_TO`,
   `HAS_INTERFACE`, `BELONGS_TO` relationships. Schema and seed are in `infra/neo4j/`. On startup
@@ -469,11 +564,13 @@ at boot rather than on the first query. Turning it off restores the fallbacks, a
 them is then reported: `GET /health` lists the active degradations and returns `503` while any
 exist, so a container running on fixtures does not look healthy to Compose, Kubernetes or a
 monitor. Disabled auth, an ephemeral signing key and an unanchored ledger are listed there too,
-for the same reason.
+for the same reason. Ollama is checked on every health request, not only during startup; if the
+host process stops, inference becomes a visible `503` instead of leaving incidents apparently
+running behind a green status.
 
 ---
 
-## 12. The dashboard
+## 13. The dashboard
 
 `apps/web` is a Next.js app polling with SWR. The incident view shows the reasoning trace, the
 raw tool log, the path visualiser, and the approval gate. The gate shows the proposed command,
@@ -483,9 +580,16 @@ approve a command whose effect, reversal or timing has not been demonstrated. Wh
 closed the approve button is disabled for everyone but an admin, who has to write a break-glass
 reason before it unlocks.
 
+The gate also states, before anything else, whether approving will write to the device or only
+record the change, and the button reads "Apply to device" or "Execute dry-run" to match. That
+string comes from the API rather than a frontend default, because a gate that says dry-run while
+the backend is live is worse than no gate. Once a decision has been made, the incident page leads
+with what execution actually did — applied, refused, rolled back, or the state that needs somebody
+at the device now — together with the policy read back off it.
+
 ---
 
-## 13. Configuration
+## 14. Configuration
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -508,11 +612,17 @@ reason before it unlocks.
 | `AUDIT_SIGNING_KEY` | empty | Ed25519 seed for the ledger. Unset means an ephemeral key, so records cannot be verified after a restart |
 | `AUDIT_RETIRED_KEYS` | empty | Public keys of previous signing keys, comma separated, so records survive a rotation |
 | `AUDIT_ANCHOR_FILE` | empty | Where the chain head is anchored. Unset means deleting the ledger leaves no trace |
-| `FIREWALL_BACKEND` | `mock` | `mock`, `cisco_asa` or `cisco_ios`. The device backends need `pip install -e "apps/api[devices]"` |
+| `FIREWALL_BACKEND` | `mock` | `mock`, `cisco_asa`, `cisco_ios` or `arista_eos`. The device backends need `pip install -e "apps/api[devices]"` |
 | `FIREWALL_HOST` / `FIREWALL_USERNAME` / `FIREWALL_PASSWORD` | empty | Read-only device credentials. The password must be a secret reference unless `REQUIRE_MANAGED_SECRETS` is off |
 | `FIREWALL_SECRET` | empty | Enable secret, only if `show` output needs privilege 15 |
 | `FIREWALL_ACL` | empty | Restricts `show access-list` to one ACL. Empty reads them all |
 | `FIREWALL_DEVICE_ID` | `FW_Edge` | Topology device name this backend answers for |
+| `EXECUTION_ENABLED` | `false` | Off means an approved change is logged, never sent |
+| `EXECUTION_DEVICES` | empty | Devices execution may touch. Empty means every change stays a dry run, whatever the flag above says |
+| `EXECUTION_AUTO_ROLLBACK` | `true` | Undo a change that fails its post-change check. Off leaves the failure in place and says so |
+| `TICKET_WEBHOOK_URL` / `TICKET_WEBHOOK_TOKEN` | empty | ServiceNow or Jira inbound endpoint. Unset means changes are not written to a ticket system |
+| `NOTIFY_WEBHOOK_URL` / `NOTIFY_WEBHOOK_TOKEN` | empty | Slack, Teams or Mattermost hook for pending approvals. A webhook URL is itself a credential, so prefer a secret reference |
+| `DASHBOARD_URL` | `http://localhost:3000` | Used for the direct link in tickets and notifications |
 | `CHANGE_WINDOWS` | empty | When changes may be approved, e.g. `mon-fri 22:00-04:00`. Empty means any time |
 | `CHANGE_FREEZES` | empty | Dates when nothing goes out, e.g. `2026-12-20..2027-01-02`. Beats any window |
 | `CHANGE_WINDOW_TZ` | `UTC` | Evaluated here, not in the server's local timezone |
@@ -523,20 +633,29 @@ reason before it unlocks.
 
 ---
 
-## 14. Running and testing
+## 15. Running and testing
 
 ```bash
 cp .env.example .env
-docker compose up -d --build            # neo4j, postgres, seed, api
-cd apps/web && npm install && npm run dev
+ollama serve
+docker compose up -d --build            # neo4j, postgres, seed, api, web
+curl -fsS http://localhost:8000/health
 ```
 
 ```bash
 cd apps/api
-.venv/bin/pytest -q                     # 208 tests, no Ollama or device needed
+.venv/bin/pytest -q                     # device tests skip visibly without the emulator
 .venv/bin/ruff check app tests
 python ../../scripts/golden_path.py     # scripted end-to-end run
 python ../../scripts/probe_turn.py      # print the model's raw reply for one turn
+```
+
+The authenticated live-model walkthrough covers health, login, MFA, investigation, approval,
+dry-run execution and ledger verification:
+
+```bash
+ZERONODE_EMAIL=you@example.com ZERONODE_PASSWORD='your-password' \
+  apps/api/.venv/bin/python scripts/e2e_walkthrough.py
 ```
 
 `scripts/probe_turn.py` is the fastest way to debug model behaviour: it replays a
@@ -545,19 +664,23 @@ instead of the several minutes a full incident needs on CPU.
 
 ---
 
-## 15. Known limitations
+## 16. Known limitations
 
 Being explicit about these matters more than the feature list.
 
+- **Execution has never run against real hardware.** The write path is guarded and has run over
+  real SSH against the device emulator, including a failed verification and rollback. That proves
+  the transport and lifecycle, not vendor behaviour. The next honest test is an L4 Containerlab
+  node.
 - **No device backend has been run against real hardware.** Parsers are tested against captured
-  output and the transport is a thin Netmiko wrapper, but nothing here has met a live appliance
-  with its own banners, prompts and timeouts. `python -m app.firewall.probe` exists to close this
-  in one read-only command; until someone runs it against a given device, that device is
-  unproven.
+  output and Netmiko has met the SSH emulator's banners, prompts, paging and timeouts, but no
+  backend has met a vendor appliance. `python -m app.firewall.probe` exists to close this in one
+  read-only command; until it is run against a given device, that device is unproven.
 - **Expansion has ceilings**: port ranges wider than 64, address ranges spanning more than 16
   prefixes, and rules expanding past 2,048 combinations are left unparsed rather than
   materialised.
-- **Two vendors.** Cisco ASA and IOS; NX-OS, Palo Alto and Fortinet are unimplemented.
+- **Narrow vendor coverage.** Cisco ASA and IOS are the production-targeted parsers; EOS exists
+  for the Containerlab rung. NX-OS, Palo Alto and Fortinet are unimplemented.
 - **NAT is detected, not modelled.** A translated flow makes the simulator decline to give a
   verdict rather than reason through the translation, so those incidents fall back to a human.
 - **No SSO, and sessions cannot be revoked** before their token expires. Authorisation is not
@@ -567,12 +690,20 @@ Being explicit about these matters more than the feature list.
   nothing to resume it.
 - **One scenario, five devices, all of it seeded by hand.** The lab proves the workflow, not scale,
   and the seed was written to fit the queries rather than the other way round. The ladder out of
-  this is in "Test environments" below: NetBox for a real inventory, Containerlab for a real CLI.
+  this is in "Test environments" below: a device-shaped SSH server for a real session, NetBox for a real inventory, Containerlab for a real CLI.
 - **Prompt-injection defence is mitigation, not prevention.** Alert and device text is cleaned,
   fenced and flagged, but pattern matching on natural language loses to rephrasing. What actually
   holds is structural: no execution, evidence read from the device, and a signed human approval.
 - **Rollback is verified as an inverse, not as a recovery procedure.** It proves the reversal
   undoes the rule; it says nothing about anything else the change disturbed.
+- **Post-change verification proves the policy, not the service.** It confirms the device now
+  permits the flow; it does not open a socket, and nothing here watches whether the application
+  actually recovered. Hit counters need traffic to move, so they cannot stand in for it.
+- **Ticketing and notifications are outbound only.** ZeroNode opens, comments on and closes a
+  ticket, but never reads one, so closing an incident in ServiceNow does not close it here. A
+  failed delivery is logged, not retried or queued.
+- **Executed changes are not saved to startup configuration.** Deliberate while execution is new,
+  but it means a reload silently undoes an applied fix.
 - **Change windows are enforced at the gate only.** Nothing schedules a change for the next
   window, so an incident raised during a freeze waits for a person.
 - **Secret references cover the credentials the API resolves.** `DATABASE_URL` still carries its
@@ -581,7 +712,7 @@ Being explicit about these matters more than the feature list.
 
 ---
 
-## 16. Path to production
+## 17. Path to production
 
 Ordered by what would block a first real deployment. Phase 1 is the difference between a working
 system and a supervised pilot on a live network.
@@ -594,28 +725,82 @@ fixtures. Three rungs, each answering a question the one below it cannot:
 
 | Rung | Environment | What it can prove | Status |
 | --- | --- | --- | --- |
-| L1 | Static fixtures and a seeded Neo4j graph | The state machine, the parsers and the simulator, deterministically and with no hardware | Current |
-| L2 | A local NetBox container with 10–20 interconnected virtual devices | That the graph layer answers relational questions against a real source of truth, not a hand-written seed | Not started |
-| L3 | Containerlab with three nodes, two switches and a firewall | That a proposed policy diff maps onto real interface configuration, and that the read paths survive a live CLI | Not started |
+| L1 | Static fixtures and a seeded Neo4j graph | The state machine, the parsers and the simulator, deterministically and with no hardware | Running |
+| L2 | An SSH server shaped like a device, in Compose | That the client survives a real session, and that a change applied to something that actually changes is verified and undone correctly | Running |
+| L3 | NetBox as the source of truth | That the graph layer answers relational questions against a real inventory rather than a seed written to fit the queries | Built, unrun |
+| L4 | Containerlab with a real network OS | That a proposed diff maps onto real interface configuration, on a CLI nobody wrote for us | Built, needs an image |
 
 L1 is deliberately where the unit tests stay. Determinism is the point: a parser test that needs a
-container is a parser test people stop running. What L1 cannot do is tell you whether the topology
-model survives contact with a real inventory, because the seed was written to fit the queries.
+container is a parser test people stop running. What L1 cannot do is tell you whether the client
+survives a session it did not construct, because L1 replaces the transport.
 
-L2 replaces the hand-seeded graph with an ingest from NetBox, which is where the current
-`ensure_seed` shortcut breaks: twenty devices with real interfaces and terminations will produce
-paths the traversal has never seen, and freshness becomes a property the agent has to reason about
-rather than assume. This is the concrete first step of "topology ingestion" in Phase 5, and it can
-be done before anything executes.
+**L2 — a device-shaped SSH server** (`infra/fakeasa`). Not a simulator, and worth being precise
+about what it is not: it proves nothing about ASA syntax, which fixtures already cover. What it
+proves is everything around the syntax — SSH negotiation, character echo, prompt detection, enable
+mode, paging, configuration mode, and a device whose ACL genuinely changes when you configure it.
 
-L3 is where the read paths meet a live CLI — real banners, paging, prompts and timeouts — which is
-exactly what `python -m app.firewall.probe` was built to measure, and it is the honest place to
-run it before pointing at production hardware. It is also the only environment where executing a
-change is safe to attempt, so it gates Phase 2 rather than sitting alongside it.
+```bash
+cd /path/to/ZeroNode && scripts/lab_device_test.sh
+```
 
-One naming note to avoid confusion: these rungs are labelled L1–L3 because the numbered phases
-below already mean something different. L1 is where the project is today, and it spans all of
-Phase 1.
+The script itself does not care what the working directory is — it resolves the
+repository from its own location — but the path you invoke it by still has to be
+right. From `apps/api`, that is `../../scripts/lab_device_test.sh`.
+
+It starts the emulator, waits for it to accept connections, runs the tests with
+the project's interpreter and takes the container down again. Running the tests by
+hand works too, but note that they need the `devices` extra and skip themselves
+without it — a system `pytest`, or a missing emulator, produces a run that passes
+because nothing executed. The script refuses in both cases rather than being quiet
+about it, and skip reasons are printed by default.
+
+It found two things fixtures could not. Netmiko's ASA driver insists on reaching enable mode during
+session setup, so a read-only account that lands in user exec fails at connect rather than at the
+first command — the account needs privilege 15 or an enable secret. And the position a proposal was
+simulated at was never being sent to the device, so every live execution would have appended the
+rule after the deny that prompted it, failed its read-back, and rolled back. Both are fixed.
+
+**L3 — NetBox** (`scripts/ingest_netbox.py`). Replaces the hand-seeded graph with an ingest from an
+inventory that does not cooperate: devices with no zone recorded, cables that terminate on patch
+panels and cannot be traced, names that collide across sites.
+
+```bash
+docker compose --profile netbox up -d          # ~3 GB of images
+python scripts/ingest_netbox.py --token <api-token> --dry-run
+python scripts/ingest_netbox.py --token <api-token> --replace
+```
+
+The ingest reports what it could not model rather than filling it in. A device with no security
+zone matters more than it looks: a missing zone reads as "no boundary crossed", which is the wrong
+answer delivered confidently. Zones come from a `security_zone` custom field or a `zone:NAME` tag.
+
+**L4 — Containerlab** (`infra/containerlab/zeronode.clab.yml`). The cross-zone scenario as a real
+network: two hosts either side of a firewall, with the shadowing deny already in the startup
+config. The firewall is Arista EOS, for one unglamorous reason — it is the only credible network OS
+whose image anyone can obtain without a hardware or simulator licence. Cisco IOL and ASAv need CML
+or a Cisco account, and the topology takes either in place of the EOS node if you have one.
+
+EOS is IOS-like, not IOS, so it has its own adapter (`app/firewall/eos.py`). The difference that
+matters is that EOS prints prefixes where IOS prints wildcard masks; reusing the IOS parser reads
+`10.10.1.0/24` as a single host and silently narrows every rule it touches.
+
+The image is not redistributable, so this rung needs one manual step:
+
+```bash
+# after downloading cEOS from arista.com
+docker import cEOS64-lab-4.32.2F.tar ceos:4.32.2F
+sudo clab deploy -t infra/containerlab/zeronode.clab.yml
+FIREWALL_BACKEND=arista_eos FIREWALL_HOST=172.20.20.11 python -m app.firewall.probe
+```
+
+On macOS containerlab needs a Linux host, since it uses netlink and network namespaces directly:
+run it inside a VM (OrbStack, Colima or Lima), or dockerised with `--pid host` on Docker Desktop.
+Without `--pid host` the nodes come up unwired, which looks like a macOS limitation and is not. A
+Docker Desktop restart destroys the veth links, so redeploy with `--reconfigure` rather than
+restarting the containers.
+
+One naming note to avoid confusion: these rungs are labelled L1–L4 because the numbered phases
+below already mean something different.
 
 ### Phase 1 — Safety and trust (blocking)
 
@@ -634,11 +819,14 @@ Phase 1.
 
 | Item | Why |
 | --- | --- |
-| Execute against a real device behind a feature flag, dry-run by default | The point of the system. First target is an L3 Containerlab node, not production hardware |
-| Post-change verification against live telemetry | Confirm the flow actually recovered, rather than trusting the simulation |
-| Automatic rollback on failed verification | Bounded blast radius |
-| Ticket integration (ServiceNow / Jira) | Changes must land where the organisation already tracks them |
-| Notifications for pending approvals | Nobody watches a dashboard |
+| ~~Execute against a real device behind a feature flag, dry-run by default~~ | Done: two switches rather than one, a single write-capable class, and preconditions re-checked at execution time. Exercised end to end against the L2 device emulator, including a failed change that was rolled back on the device; unrun against hardware |
+| ~~Post-change verification against live telemetry~~ | Done: policy re-read from the device with the cache dropped, checking both that the rule landed and that the flow now evaluates to permit |
+| ~~Automatic rollback on failed verification~~ | Done: reversal on a failed check or a part-way failure, confirmed by a second read, with `rollback_failed` as a loud terminal state |
+| ~~Ticket integration (ServiceNow / Jira)~~ | Done as a webhook, and it closes the loop it opens: incident raised, decision, execution outcome, and closure when the investigation ends. A native client can implement the same interface later |
+| ~~Notifications for pending approvals~~ | Done: fired every time the graph stops at the gate, including after a rejection sends the specialist back to re-plan, carrying the command, the simulation verdict, window state, injection flags and a direct link |
+
+What is not done is running any of it against something that can be broken. The gate for that is
+L4 below, and no phase after this one should start before it.
 
 ### Phase 3 — Reliability
 
@@ -663,7 +851,7 @@ Phase 1.
 
 | Item | Why |
 | --- | --- |
-| Topology ingestion from NetBox, LLDP or SNMP, with freshness tracking | A hand-seeded graph does not survive contact with a real network. The L2 environment is where this starts, and it does not have to wait for Phase 5 |
+| Topology ingestion from NetBox, LLDP or SNMP, with freshness tracking | A hand-seeded graph does not survive contact with a real network. The L3 environment is where this starts, and it does not have to wait for Phase 5 |
 | Multi-vendor config normalisation | Cisco-only parsing is a hard ceiling |
 | More scenarios: routing, MTU, asymmetric paths, BGP | One scenario proves the workflow, not the coverage an operator needs |
 | Multi-tenancy and per-site isolation | Required for managed-service use |

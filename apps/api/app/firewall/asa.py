@@ -346,6 +346,10 @@ class CiscoAsaFirewall(SshDevice):
         self._defs = (groups, objects)
         return self._defs
 
+    def refresh(self, device_id: str) -> None:
+        self._cache.pop(device_id, None)
+        self._defs = None
+
     def _policy_result(self, device_id: str, refresh: bool = False) -> AclParseResult:
         if refresh or device_id not in self._cache:
             command = "show access-list"

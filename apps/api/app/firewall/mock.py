@@ -62,6 +62,9 @@ class MockFirewall:
     def describe(self) -> str:
         return "mock fixtures (no device contacted)"
 
+    def refresh(self, device_id: str) -> None:
+        """Fixtures are read fresh every time."""
+
     def acl_policy(self, device_id: str) -> list[AclRule]:
         rules = [
             AclRule(

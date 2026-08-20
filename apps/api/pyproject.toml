@@ -64,3 +64,6 @@ extend-immutable-calls = [
 pythonpath = ["."]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Report skip reasons. The device tests skip themselves when the emulator is
+# not running or the devices extra is missing, and a silent skip reads as a pass.
+addopts = "-rs"

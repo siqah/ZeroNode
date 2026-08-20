@@ -117,4 +117,8 @@ def make_device_firewall(
         from app.firewall.ios import CiscoIosFirewall
 
         return CiscoIosFirewall(**kwargs)
+    if backend == "arista_eos":
+        from app.firewall.eos import AristaEosFirewall
+
+        return AristaEosFirewall(**kwargs)
     raise RuntimeError(f"Unknown device backend: {backend!r}")

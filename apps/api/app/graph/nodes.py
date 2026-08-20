@@ -8,6 +8,15 @@ from langgraph.graph import END
 from langgraph.types import Command
 from pydantic import ValidationError
 
+from app.execute.base import (
+    APPLIED,
+    LOGGED,
+    REFUSED,
+    ROLLBACK_FAILED,
+    ROLLED_BACK,
+    Executor,
+)
+from app.execute.dryrun import DryRunExecutor
 from app.firewall.base import FirewallStore
 from app.graph.parser import (
     ParsedToolCall,
@@ -227,7 +236,11 @@ def firewall_node(state: NetworkAgentState, agent: AgentRuntime) -> Command:
     )
 
 
-def execute_change(state: NetworkAgentState, firewall: FirewallStore) -> Command:
+def execute_change(
+    state: NetworkAgentState,
+    firewall: FirewallStore,
+    executor: Executor | None = None,
+) -> Command:
     decision = (state.get("human_decision") or "").strip().lower()
     feedback = (state.get("human_feedback") or "").strip()
     actions = state.get("pending_actions") or []
@@ -257,26 +270,44 @@ def execute_change(state: NetworkAgentState, firewall: FirewallStore) -> Command
 
     lines = [str(item.get("command", "")).strip() for item in actions]
     commands = "\n".join(line for line in lines if line) or "(none)"
+    flows = list(state.get("denied_flows") or [])
     # Re-run the simulation against the approved commands so the audit record
     # reflects what was signed off, not what was first proposed.
-    report = verify_change(actions, list(state.get("denied_flows") or []), firewall)
+    report = verify_change(actions, flows, firewall)
     verdict = "VERIFIED" if report.ok else "NOT VERIFIED"
     reversals = "\n".join(
         str(item.get("rollback", "")).strip() for item in actions if item.get("rollback")
     )
+
+    result = (executor or DryRunExecutor()).apply(actions, flows)
+    headline = {
+        LOGGED: f"DRY-RUN approved by {actor} ({verdict}). Commands logged, not executed:",
+        APPLIED: f"APPLIED to the device, approved by {actor} ({verdict}):",
+        REFUSED: f"NOT EXECUTED, approved by {actor} ({verdict}). Commands:",
+        ROLLED_BACK: f"ROLLED BACK after a failed check, approved by {actor} ({verdict}):",
+        ROLLBACK_FAILED: (
+            f"MANUAL INTERVENTION NEEDED. Approved by {actor} ({verdict}) and the device "
+            "could not be returned to its previous state:"
+        ),
+    }.get(result.state, f"Approved by {actor} ({verdict}):")
+
     summary = (
-        f"DRY-RUN approved by {actor} ({verdict}). Commands logged, not executed:\n"
+        headline
+        + "\n"
         + commands
         + (f"\nEngineer note: {feedback}" if feedback else "")
         + (f"\nRollback:\n{reversals}" if reversals else "")
-        + "\nVerification: "
+        + "\nSimulation: "
         + " ".join(report.lines)
+        + "\nExecution: "
+        + " ".join(result.lines + result.verification)
     )
     return Command(
         goto=END,
         update={
             "findings_summary": summary,
             "verification": report.lines,
+            "execution": result.as_dict(),
             "active_worker": "",
         },
     )

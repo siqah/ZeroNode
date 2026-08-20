@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://zeronode:zeronode@localhost:5433/zeronode"
     # Device access. "mock" uses fixtures; "cisco_asa" and "cisco_ios" open a
     # read-only SSH session.
-    firewall_backend: str = "mock"
+    firewall_backend: str = "mock"  # mock | cisco_asa | cisco_ios | arista_eos
     firewall_host: str = ""
     firewall_username: str = ""
     firewall_password: str = ""
@@ -57,6 +57,24 @@ class Settings(BaseSettings):
     # Where to anchor the chain head. Put it on a volume the database cannot
     # write to, otherwise dropping the table also removes the evidence.
     audit_anchor_file: str = ""
+
+    # Execution. Off means an approved change is logged, never sent. Turning it
+    # on is not enough: EXECUTION_DEVICES must name the devices it may touch.
+    execution_enabled: bool = False
+    execution_devices: str = ""
+    # After a failed post-change check, put the device back automatically.
+    # Turning this off leaves a failed change in place for a human.
+    execution_auto_rollback: bool = True
+
+    # Ticketing and notifications. Both are webhooks: a ServiceNow or Jira
+    # inbound endpoint for the first, a Slack, Teams or Mattermost one for the
+    # second. Unset means the workflow runs without them.
+    ticket_webhook_url: str = ""
+    ticket_webhook_token: str = ""
+    notify_webhook_url: str = ""
+    notify_webhook_token: str = ""
+    # Used to build direct links in tickets and notifications.
+    dashboard_url: str = "http://localhost:3000"
 
     # Change windows, e.g. "mon-fri 22:00-04:00; sat,sun 00:00-06:00". Empty
     # means a change may be approved at any time. Freezes, e.g.

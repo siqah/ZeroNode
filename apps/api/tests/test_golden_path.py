@@ -1,13 +1,14 @@
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
+from app.execute.base import ROLLBACK_FAILED, ExecutionResult
 from app.graph.builder import build_graph
 from app.graph.scripted import scripted_llm
 from app.store.memory import InMemoryTopology
 
 
-def _run_golden():
-    graph = build_graph(scripted_llm(), InMemoryTopology())
+def _run_golden(executor=None):
+    graph = build_graph(scripted_llm(), InMemoryTopology(), executor=executor)
     config = {"configurable": {"thread_id": "INC-1001"}}
     graph.invoke(
         {
@@ -81,3 +82,34 @@ def test_golden_path_approve_is_dry_run():
     assert "not executed" in summary
     assert "permit tcp" in summary
     assert "PASS" in summary
+    assert snapshot.values["execution"]["state"] == "logged"
+
+
+def test_an_execution_failure_reaches_the_incident_rather_than_a_log_file():
+    """Whatever execution does, the incident has to say so."""
+
+    class Failing:
+        def describe(self):
+            return "test executor"
+
+        def apply(self, actions, flows):
+            return ExecutionResult(
+                mode="device",
+                state=ROLLBACK_FAILED,
+                lines=["THE ROLLBACK ALSO FAILED. Intervene by hand now."],
+            )
+
+    graph, config = _run_golden(executor=Failing())
+    graph.invoke(
+        Command(
+            resume=True,
+            update={"human_decision": "approve", "human_actor": "alice@example.com"},
+        ),
+        config,
+    )
+    snapshot = graph.get_state(config)
+    summary = snapshot.values["findings_summary"]
+
+    assert summary.startswith("MANUAL INTERVENTION NEEDED")
+    assert "Intervene by hand now" in summary
+    assert snapshot.values["execution"]["state"] == "rollback_failed"

@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from app.audit import store as audit_store
 from app.auth.deps import require_role
 from app.auth.models import Principal, Role
+from app.config import settings
+from app.outbound import NullNotifier, NullTicketSink, pending_approval_message
 from app.sanitize import fence_alert, sanitize
 from app.schedule import ChangeSchedule
 from app.store import incidents as incident_store
@@ -109,9 +111,19 @@ async def trigger_investigation(
     async def _run() -> None:
         try:
             await graph.ainvoke(initial, config)
-        except Exception:
+        except Exception as exc:
             logger.exception("graph failed for %s", body.ticket_id)
+            failures = getattr(request.app.state, "graph_failures", None)
+            if failures is None:
+                failures = {}
+                request.app.state.graph_failures = failures
+            failures[body.ticket_id] = str(exc)
+            return
+        getattr(request.app.state, "graph_failures", {}).pop(body.ticket_id, None)
+        await _notify_if_waiting(request, body.ticket_id)
+        await _close_if_finished(request, body.ticket_id)
 
+    await _tickets(request).opened(body.ticket_id, description, body.severity)
     asyncio.create_task(_run())
     logger.info("incident %s triggered by %s", body.ticket_id, principal.subject)
     return {"status": "Agent dispatched", "thread_id": body.ticket_id}
@@ -135,7 +147,16 @@ async def list_incidents(
         snapshot = await graph.aget_state(_thread_config(row["thread_id"]))
         values = snapshot.values or {}
         nxt = tuple(snapshot.next or ())
-        enriched.append({**row, "status": _status_from_snapshot(values, nxt)})
+        failure = getattr(request.app.state, "graph_failures", {}).get(
+            row["thread_id"], ""
+        )
+        enriched.append(
+            {
+                **row,
+                "status": "failed" if failure else _status_from_snapshot(values, nxt),
+                "error": failure or None,
+            }
+        )
     return {"incidents": enriched}
 
 
@@ -147,11 +168,32 @@ async def get_incident_status(
     snapshot = await graph.aget_state(_thread_config(thread_id))
     values = snapshot.values or {}
     nxt = tuple(snapshot.next or ())
+    failure = getattr(request.app.state, "graph_failures", {}).get(thread_id, "")
     if not values and not nxt:
+        if failure:
+            return {
+                "thread_id": thread_id,
+                "status": "failed",
+                "error": failure,
+                "current_node": None,
+                "agent_summary": "",
+                "topology_context": "",
+                "zone_context": "",
+                "verification": [],
+                "proposed_actions": [],
+                "reasoning_trace": [],
+                "tool_log": [],
+                "active_worker": "",
+                "alert_flags": [],
+                "execution": None,
+                "execution_mode": _execution_mode(request),
+                "change_window": _window_state(request),
+            }
         raise HTTPException(status_code=404, detail="Unknown or still-queued incident")
     return {
         "thread_id": thread_id,
-        "status": _status_from_snapshot(values, nxt),
+        "status": "failed" if failure else _status_from_snapshot(values, nxt),
+        "error": failure or None,
         "current_node": nxt[0] if nxt else None,
         "agent_summary": values.get("findings_summary", ""),
         "topology_context": values.get("topology_context", ""),
@@ -162,8 +204,67 @@ async def get_incident_status(
         "tool_log": values.get("tool_log") or [],
         "active_worker": values.get("active_worker", ""),
         "alert_flags": values.get("alert_flags") or [],
+        "execution": values.get("execution") or None,
+        "execution_mode": _execution_mode(request),
         "change_window": _window_state(request),
     }
+
+
+def _execution_mode(request: Request) -> str:
+    """Whether approving means "logged" or "written to hardware"."""
+    executor = getattr(request.app.state, "executor", None)
+    return executor.describe() if executor else "dry-run (no device is contacted)"
+
+
+def _tickets(request: Request):
+    return getattr(request.app.state, "tickets", None) or NullTicketSink()
+
+
+def _notifier(request: Request):
+    return getattr(request.app.state, "notifier", None) or NullNotifier()
+
+
+async def _notify_if_waiting(request: Request, thread_id: str) -> None:
+    """Tell someone, once the graph has actually stopped at the gate.
+
+    Fired after the run returns rather than from inside the node, because until
+    the graph pauses there is nothing for a person to act on, and an alert that
+    arrives before the proposal exists trains people to ignore alerts.
+    """
+    snapshot = await request.app.state.graph.aget_state(_thread_config(thread_id))
+    if "execute_change" not in tuple(snapshot.next or ()):
+        return
+
+    values = snapshot.values or {}
+    window = _schedule(request).evaluate()
+    text = pending_approval_message(
+        thread_id,
+        values.get("pending_actions") or [],
+        settings.dashboard_url,
+        window_reason="" if window.open else window.reason,
+        alert_flags=values.get("alert_flags") or [],
+    )
+    await _notifier(request).send(text, {"incident": thread_id, "event": "approval.pending"})
+    await _tickets(request).commented(
+        thread_id, text, {"event": "approval.pending", "state": "awaiting_approval"}
+    )
+
+
+async def _close_if_finished(request: Request, thread_id: str) -> None:
+    """Close the ticket when the incident actually ends.
+
+    An integration that opens tickets and never closes them is worse than no
+    integration: it teaches people that the queue is noise.
+    """
+    snapshot = await request.app.state.graph.aget_state(_thread_config(thread_id))
+    if tuple(snapshot.next or ()):
+        return
+
+    values = snapshot.values or {}
+    await _tickets(request).closed(
+        thread_id,
+        values.get("findings_summary") or "The investigation finished with no summary.",
+    )
 
 
 def _schedule(request: Request) -> ChangeSchedule:
@@ -180,6 +281,55 @@ def _window_state(request: Request) -> dict[str, Any]:
         "next_open": decision.next_open,
         "policy": schedule.describe(),
     }
+
+
+async def _record_execution(request: Request, thread_id: str, principal: Principal) -> None:
+    """Seal what execution actually did into the same chain as the approval.
+
+    The approval says what a person agreed to; this says what the system then
+    did with it. Recording only the first would leave the more consequential
+    half of the story outside the audit trail.
+    """
+    pool = getattr(request.app.state, "pool", None)
+    if pool is None:
+        return
+
+    snapshot = await request.app.state.graph.aget_state(_thread_config(thread_id))
+    execution = (snapshot.values or {}).get("execution")
+    if not execution or execution.get("state") == "logged":
+        # A dry run is already fully described by the approval record.
+        return
+
+    try:
+        async with pool.connection() as conn:
+            await audit_store.append_approval(
+                conn,
+                request.app.state.keyset.active,
+                thread_id=thread_id,
+                decision=f"execution:{execution.get('state')}",
+                feedback="",
+                actor="system",
+                actor_role="system",
+                evidence={"execution": execution, "on_behalf_of": principal.subject},
+                sink=request.app.state.anchor_sink,
+            )
+    except Exception:
+        logger.exception("could not record the execution of %s", thread_id)
+
+    state = str(execution.get("state"))
+    narrative = " ".join(execution.get("lines") or []) or state
+    await _tickets(request).commented(
+        thread_id, f"Execution {state}: {narrative}", {"event": f"execution.{state}"}
+    )
+
+    if state in ("rollback_failed", "refused"):
+        # The two outcomes a person has to know about immediately: a device left
+        # in a state nobody chose, and an approval that quietly did nothing.
+        logger.error("%s on %s: %s", state, thread_id, narrative)
+        await _notifier(request).send(
+            f"ZeroNode {thread_id}: execution {state}. {narrative}",
+            {"incident": thread_id, "event": f"execution.{state}"},
+        )
 
 
 @router.post("/incidents/{thread_id}/resume")
@@ -291,9 +441,26 @@ async def resume_investigation(
             )
         except Exception:
             logger.exception("resume failed for %s", thread_id)
+            return
+        await _record_execution(request, thread_id, principal)
+        # A rejection sends the specialist back to re-plan, and the revised
+        # proposal stops at the same gate. Without this, every proposal after
+        # the first is silent, which is the point at which people stop trusting
+        # the notification.
+        await _notify_if_waiting(request, thread_id)
+        await _close_if_finished(request, thread_id)
 
     asyncio.create_task(_run())
-    logger.info("%s %sd %s", principal.subject, body.decision, thread_id)
+    verb = "approved" if body.decision == "approve" else "rejected"
+    logger.info("%s %s %s", principal.subject, verb, thread_id)
+    await _tickets(request).commented(
+        thread_id,
+        f"{principal.subject} {verb} the proposed change."
+        + (f" Note: {body.feedback}" if body.feedback else "")
+        + (f" Change window overridden: {override['reason']}" if override else "")
+        + (f" Ledger record {receipt['hash'][:16]}." if receipt else ""),
+        {"event": f"approval.{body.decision}", "actor": principal.subject},
+    )
     return {
         "status": f"Graph resumed with decision: {body.decision}",
         "actor": principal.subject,

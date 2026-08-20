@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import ApprovalGate from "@/components/ApprovalGate";
+import ExecutionOutcome from "@/components/ExecutionOutcome";
 import PathVisualizer from "@/components/PathVisualizer";
 import ReasoningTrace from "@/components/ReasoningTrace";
 import SessionBar from "@/components/SessionBar";
@@ -73,6 +74,9 @@ export default function IncidentPage() {
               <ReasoningTrace steps={agentState?.tool_log ?? []} />
             </div>
           ) : null}
+          {agentState?.execution ? (
+            <ExecutionOutcome execution={agentState.execution} />
+          ) : null}
           {agentState?.status === "awaiting_approval" ? (
             <ApprovalGate
               threadId={threadId}
@@ -83,6 +87,7 @@ export default function IncidentPage() {
               role={session?.role}
               changeWindow={agentState.change_window}
               alertFlags={agentState.alert_flags ?? []}
+              executionMode={agentState.execution_mode ?? ""}
               onDone={() => mutate()}
             />
           ) : null}

@@ -6,6 +6,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from app.execute.base import Executor
 from app.firewall.base import FirewallStore
 from app.firewall.mock import MockFirewall
 from app.graph.nodes import AgentRuntime, execute_change, firewall_node, supervisor_node
@@ -18,6 +19,7 @@ def build_graph(
     topology: TopologyStore,
     checkpointer: BaseCheckpointSaver | None = None,
     firewall: FirewallStore | None = None,
+    executor: Executor | None = None,
 ) -> CompiledStateGraph:
     agent = AgentRuntime(llm=llm, topology=topology, firewall=firewall or MockFirewall())
 
@@ -28,7 +30,7 @@ def build_graph(
         return firewall_node(state, agent)
 
     def execute(state: NetworkAgentState):
-        return execute_change(state, agent.firewall)
+        return execute_change(state, agent.firewall, executor)
 
     builder = StateGraph(NetworkAgentState)
     builder.add_node("supervisor", supervisor)

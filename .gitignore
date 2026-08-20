@@ -3,17 +3,27 @@
 .env
 .env.*
 !.env.example
+.envrc
+.direnv/
 apps/web/.env
 apps/web/.env.*
 !apps/web/.env.example
 secrets/
+credentials/
+private/
 *.secret
+*.credentials
+*.token
 
 # Private key material: ledger signing seeds, SSH keys, device certificates
 *.pem
 *.key
+*.crt
+*.cer
 *.p12
 *.pfx
+*.jks
+*.keystore
 id_rsa*
 id_ed25519*
 
@@ -21,6 +31,11 @@ id_ed25519*
 # default location is .zeronode/, but AUDIT_ANCHOR_FILE may point anywhere.
 .zeronode/
 *anchors*.jsonl
+*.pid
+*.sock
+*.db
+*.sqlite
+*.sqlite3
 
 # Python
 .venv/
@@ -31,7 +46,13 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+junit*.xml
+.hypothesis/
+.tox/
+.nox/
 *.egg-info/
 dist/
 build/
@@ -49,6 +70,24 @@ infra/neo4j/logs/
 infra/neo4j/import/
 infra/neo4j/plugins/
 infra/postgres/data/
+infra/netbox/data/
+infra/netbox/media/
+
+# Network operating-system and packet-capture artifacts are licensed, large,
+# or contain real traffic. Track topology/config text, never the images.
+infra/containerlab/*.tar
+infra/containerlab/*.tgz
+infra/containerlab/*.qcow2
+infra/containerlab/*.img
+infra/containerlab/*.iso
+infra/containerlab/*.bin
+*.pcap
+*.pcapng
+
+# IaC state commonly contains rendered credentials.
+*.tfstate
+*.tfstate.*
+.terraform/
 
 # Editors and operating systems
 .DS_Store
@@ -56,4 +95,10 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+.cursor/
 *.swp
+*.swo
+
+# Local Compose customizations may contain host paths and credentials.
+docker-compose.override.yml
+compose.override.yml

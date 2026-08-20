@@ -15,6 +15,15 @@ export type ProposedAction = {
   rollback_verified?: boolean;
 };
 
+export type Execution = {
+  mode: string;
+  state: "logged" | "applied" | "refused" | "rolled_back" | "rollback_failed";
+  lines: string[];
+  verification: string[];
+  commands: string[];
+  errors: string[];
+};
+
 export type ChangeWindow = {
   open: boolean;
   reason: string;
@@ -36,6 +45,8 @@ export type AgentStatus = {
   active_worker: string;
   alert_flags: string[];
   change_window: ChangeWindow;
+  execution: Execution | null;
+  execution_mode: string;
 };
 
 export type IncidentRow = {

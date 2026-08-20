@@ -17,42 +17,48 @@ from app.audit.anchor import AnchorSink, seal_anchor
 from app.audit.keys import KeySet, rotation_evidence
 from app.audit.ledger import GENESIS_HASH, ApprovalRecord, SealedApproval, Signer
 
-CREATE_APPROVALS = """
-CREATE TABLE IF NOT EXISTS approvals (
-    id BIGSERIAL PRIMARY KEY,
-    thread_id TEXT NOT NULL,
-    decision TEXT NOT NULL,
-    feedback TEXT NOT NULL DEFAULT '',
-    actor TEXT NOT NULL,
-    actor_role TEXT NOT NULL,
-    evidence JSONB NOT NULL,
-    created_at TEXT NOT NULL,
-    prev_hash TEXT NOT NULL,
-    hash TEXT NOT NULL UNIQUE,
-    signature TEXT NOT NULL,
-    key_id TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS approvals_thread_idx ON approvals (thread_id);
-
-CREATE OR REPLACE FUNCTION approvals_append_only() RETURNS trigger AS $$
-BEGIN
-    RAISE EXCEPTION 'approvals is append-only; % is not permitted', TG_OP;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS approvals_no_mutate ON approvals;
-CREATE TRIGGER approvals_no_mutate
-BEFORE UPDATE OR DELETE ON approvals
-FOR EACH ROW EXECUTE FUNCTION approvals_append_only();
-"""
+# One statement per entry: the pool prepares every statement, and a prepared
+# statement cannot carry more than one command.
+CREATE_APPROVALS = (
+    """
+    CREATE TABLE IF NOT EXISTS approvals (
+        id BIGSERIAL PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        feedback TEXT NOT NULL DEFAULT '',
+        actor TEXT NOT NULL,
+        actor_role TEXT NOT NULL,
+        evidence JSONB NOT NULL,
+        created_at TEXT NOT NULL,
+        prev_hash TEXT NOT NULL,
+        hash TEXT NOT NULL UNIQUE,
+        signature TEXT NOT NULL,
+        key_id TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS approvals_thread_idx ON approvals (thread_id)",
+    """
+    CREATE OR REPLACE FUNCTION approvals_append_only() RETURNS trigger AS $$
+    BEGIN
+        RAISE EXCEPTION 'approvals is append-only; % is not permitted', TG_OP;
+    END;
+    $$ LANGUAGE plpgsql
+    """,
+    "DROP TRIGGER IF EXISTS approvals_no_mutate ON approvals",
+    """
+    CREATE TRIGGER approvals_no_mutate
+    BEFORE UPDATE OR DELETE ON approvals
+    FOR EACH ROW EXECUTE FUNCTION approvals_append_only()
+    """,
+)
 
 # Serialises appends so two concurrent approvals cannot claim the same predecessor.
 CHAIN_LOCK = "SELECT pg_advisory_xact_lock(hashtext('zeronode_approvals'))"
 
 
 async def ensure_approvals_table(conn: psycopg.AsyncConnection) -> None:
-    await conn.execute(CREATE_APPROVALS)
+    for statement in CREATE_APPROVALS:
+        await conn.execute(statement)
 
 
 async def _head(conn: psycopg.AsyncConnection) -> tuple[str, str, int]:

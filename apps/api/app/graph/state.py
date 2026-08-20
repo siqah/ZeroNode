@@ -18,6 +18,8 @@ class NetworkAgentState(TypedDict, total=False):
     denied_flows: list[dict[str, Any]]
     verification: list[str]
     verify_attempts: int
+    # What happened after approval: dry run, applied, refused or rolled back.
+    execution: dict[str, Any]
     topology_context: str
     zone_context: str
     # What the alert text looked like it was trying to do, if anything.
