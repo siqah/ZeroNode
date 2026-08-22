@@ -38,12 +38,17 @@ Incumbents (NetBox Copilot, Juniper Marvis) are vendor-locked, API-hosted, and l
 
 ### Compute — pluggable inference, CPU orchestration
 
-LangGraph + FastAPI run on CPU and stay cheap. Inference is an adapter:
+LangGraph + FastAPI run on CPU and stay cheap. Inference is an adapter — self-hosted only, not
+tied to one vendor or runtime:
 
-| Stage | Engine | Constraint |
+| Backend | Engine | Constraint |
 | --- | --- | --- |
-| v0 (now) | Local Ollama (Gemma 4, or the largest Gemma that fits) | No guided decoding. Reliability = XML tool calls + Pydantic + retry. |
-| Later | vLLM + guided JSON (Outlines), optional serverless GPU | Syntax errors drop to zero. Scale-to-zero idle cost. |
+| `ollama` (default) | Any model served by local Ollama | No guided decoding. Reliability = native/XML tool calls + Pydantic + retry |
+| `vllm` | Self-hosted vLLM or TGI on your GPU host | Same harness; point `VLLM_*` at a server you operate |
+
+The example default `gemma4:e4b` in `.env.example` is a starting point, not a requirement. Pick
+any model that can follow tool-calling instructions on your chosen backend. Nothing calls out to a
+cloud model provider.
 
 The agent never gets a shell. It gets typed tools.
 
@@ -110,7 +115,7 @@ Investigation is read-only throughout. Device read sessions can issue `show` com
 Alert / curl
     → FastAPI (CPU)
         → LangGraph (Postgres checkpointer)
-            → Ollama (host) for XML tool calls
+            → Inference backend (Ollama or self-hosted vLLM) for tool calls
             → Neo4j for path / blast radius / zone checks
             → FirewallStore (fixtures, Cisco ASA/IOS, Arista EOS or Nokia SR Linux read-only SSH)
             → Executor (dry-run, or guarded device config + verification/rollback)
@@ -118,7 +123,8 @@ Alert / curl
         → signed approval ledger + optional ticket/notification webhooks
 ```
 
-Services: Ollama on the host; Neo4j, Postgres, API, and web in Docker Compose.
+Services: inference on infrastructure you operate (Ollama on the host, or vLLM/TGI on your own
+GPU machine); Neo4j, Postgres, API, web, and worker in Docker Compose.
 
 ### API contract
 
@@ -138,7 +144,7 @@ Golden trigger: `{ "ticket_id": "INC-1001", "description": "Web_App cannot reach
 - Unattended execution: a change is only ever sent after a signed human approval, to a device named in advance, and is reversed automatically if it fails its post-change check
 - Broad multi-vendor coverage beyond ASA, IOS and the lab-focused EOS adapter
 - Bidirectional Slack / Teams ChatOps; current integrations are outbound webhooks
-- Modal, Fargate, vLLM, AWQ, guided decoding
+- Modal, Fargate, guided decoding (Outlines), AWQ quant profiles
 - LangSmith / Batfish eval factory
 - Semantic (vector) memory
 - Multi-specialist fleet (BGP, hardware, load-balancer)

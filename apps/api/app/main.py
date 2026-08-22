@@ -57,13 +57,13 @@ configure_tracing(
 
 def _inference_status() -> tuple[bool, str]:
     backend = (settings.inference_backend or "ollama").strip().lower()
-    if backend in {"openai_compatible", "vllm"}:
-        base = settings.openai_compatible_base_url.rstrip("/")
-        model = settings.openai_compatible_model or settings.ollama_model
+    if backend in {"vllm", "openai_compatible"}:
+        base = settings.vllm_base_url.rstrip("/")
+        model = settings.vllm_model or settings.ollama_model
         url = f"{base}/models"
         try:
             with urllib.request.urlopen(url, timeout=5):
-                return True, f"{model} at {base} (openai_compatible)"
+                return True, f"{model} at {base} (vllm)"
         except Exception as exc:
             return False, f"unreachable at {base} ({exc})"
     url = settings.ollama_base_url.rstrip("/") + "/api/tags"

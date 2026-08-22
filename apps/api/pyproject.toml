@@ -9,7 +9,6 @@ dependencies = [
   "langgraph>=0.2.45",
   "langchain-core>=0.3.0",
   "langchain-ollama>=0.2.0",
-  "langchain-openai>=0.2.0",
   "langgraph-checkpoint-postgres>=2.0.0",
   "psycopg[binary,pool]>=3.2.0",
   "neo4j>=5.26.0",
@@ -24,6 +23,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+vllm = [
+  "langchain-openai>=0.2.0",
+]
 devices = [
   "netmiko>=4.4.0",
 ]

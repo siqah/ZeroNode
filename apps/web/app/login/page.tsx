@@ -45,6 +45,11 @@ export default function LoginPage() {
           Approving a configuration change is a privileged action and is recorded against your
           identity.
         </p>
+        <p className="muted">
+          There is no public sign-up. Your admin creates your account and sends you the initial
+          password. On first deploy, the platform owner signs in with{" "}
+          <code>BOOTSTRAP_ADMIN_EMAIL</code> from <code>.env</code>.
+        </p>
         <label htmlFor="email">Email</label>
         <input
           id="email"

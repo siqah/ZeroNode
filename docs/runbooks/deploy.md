@@ -5,7 +5,7 @@
 - Docker and Compose
 - `.env` populated from `.env.example` (secrets, bootstrap admin, `JWT_SECRET`, `AUDIT_SIGNING_KEY`, `AUDIT_ANCHOR_FILE`)
 - `PRODUCTION_BASELINE=true`, `COOKIE_SECURE=true`, `STRICT_DEPENDENCIES=true`, `WORKER_EMBEDDED=false`
-- Ollama or vLLM reachable from the API/worker containers
+- Self-hosted inference reachable from the API/worker containers (`INFERENCE_BACKEND=ollama` with Ollama on the host, or `INFERENCE_BACKEND=vllm` with vLLM/TGI on your network — no specific model family required)
 - `SERVICE_TOKEN` for inbound alert webhooks; `PAGERDUTY_WEBHOOK_SECRET` if using PagerDuty
 
 ## Production preflight
@@ -45,8 +45,8 @@ The script builds api, worker, and web; waits for `/health`; prints JSON status.
 2. `docker compose ps` shows api, worker, postgres, neo4j healthy
 3. Sign in to the dashboard; trigger a test incident (dry-run path)
 4. `curl -fsS http://localhost:8000/api/v1/audit/verify | jq .` shows `chain_ok` and `protected`
-5. `python -m app.eval` passes (scripted corpus, no Ollama)
-6. Optional release gate: `python scripts/eval_live.py --probe-only`
+5. `python -m app.eval` passes (scripted corpus, no live model)
+6. Optional release gate: `python scripts/eval_live.py --probe-only` (against your configured inference backend)
 7. Optional datastore gate: `scripts/lab_stores_test.sh`
 
 ## Inbound webhooks

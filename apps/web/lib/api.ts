@@ -66,6 +66,17 @@ export type Session = {
   can_approve: boolean;
 };
 
+export type UserRole = "viewer" | "operator" | "approver" | "admin";
+
+export type UserRow = {
+  email: string;
+  role: UserRole;
+  active: boolean;
+  created_at: string | null;
+  mfa_enabled: boolean;
+  locked_until: string | null;
+};
+
 export type Enrolment = {
   secret: string;
   otpauth_uri: string;
@@ -160,6 +171,28 @@ export async function activateMfa(totpCode: string): Promise<void> {
 
 export async function fetchSession(): Promise<Session> {
   return request<Session>("/api/v1/auth/me");
+}
+
+export async function fetchUsers(): Promise<UserRow[]> {
+  const data = await request<{ users: UserRow[] }>("/api/v1/auth/users");
+  return data.users ?? [];
+}
+
+export async function createUser(
+  email: string,
+  password: string,
+  role: UserRole
+): Promise<{ email: string; role: UserRole }> {
+  return request("/api/v1/auth/users", {
+    method: "POST",
+    body: JSON.stringify({ email, password, role }),
+  });
+}
+
+export async function unlockUser(email: string): Promise<void> {
+  await request(`/api/v1/auth/users/${encodeURIComponent(email)}/unlock`, {
+    method: "POST",
+  });
 }
 
 export async function fetchIncidents(): Promise<IncidentRow[]> {

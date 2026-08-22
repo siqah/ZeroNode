@@ -344,6 +344,28 @@ button {
   margin-top: 20px;
 }
 
+.login select {
+  width: 100%;
+  background: #070b10;
+  color: var(--text);
+  border: 1px solid var(--line);
+  padding: 10px;
+  font-family: inherit;
+  font-size: 14px;
+}
+
+.steps {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.steps li {
+  margin-bottom: 8px;
+}
+
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;

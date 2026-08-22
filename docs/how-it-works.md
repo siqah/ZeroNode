@@ -35,7 +35,7 @@ position. That is exactly the sequence the agent has to reproduce, with its work
 flowchart LR
     Alert[Alert / webhook] --> API[FastAPI<br/>apps/api]
     API --> Graph[LangGraph state machine]
-    Graph --> Ollama[(Ollama<br/>gemma4:e4b)]
+    Graph --> LLM[(Inference backend<br/>Ollama or self-hosted vLLM)]
     Graph --> Tools[Deterministic tools]
     Tools --> Neo4j[(Neo4j<br/>topology)]
     Tools --> FW[(FirewallStore<br/>mock or read-only ASA)]
@@ -46,7 +46,9 @@ flowchart LR
     Web -->|approve / reject| API
 ```
 
-Everything runs on one machine. No telemetry leaves it, and the model is local.
+Everything runs on one machine. No telemetry leaves it unless you configure outbound webhooks.
+The model runs on infrastructure you operate (local Ollama or self-hosted vLLM/TGI on your
+network). There is no cloud inference API.
 
 ---
 
@@ -144,9 +146,9 @@ before it reaches the model, which keeps context small and cheap on CPU inferenc
 
 Three layers, in order, in `apps/api/app/graph/nodes.py`:
 
-1. **Native tool calls.** Once the history contains a tool call, Ollama's Gemma template answers
-   with a structured `tool_calls` payload and *empty* message content. This is the normal path and
-   was originally missed, which made every turn look like a parse failure.
+1. **Native tool calls.** Once the history contains a tool call, models with native tool-calling
+   support answer with a structured `tool_calls` payload and *empty* message content. This is the
+   normal path and was originally missed, which made every turn look like a parse failure.
 2. **XML-wrapped JSON.** The first turn, and any model without native tool calling, emits
    `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`. The parser tolerates unclosed tags,
    code fences and surrounding prose.
@@ -571,9 +573,9 @@ at boot rather than on the first query. Turning it off restores the fallbacks, a
 them is then reported: `GET /health` lists the active degradations and returns `503` while any
 exist, so a container running on fixtures does not look healthy to Compose, Kubernetes or a
 monitor. Disabled auth, an ephemeral signing key and an unanchored ledger are listed there too,
-for the same reason. Ollama is checked on every health request, not only during startup; if the
-host process stops, inference becomes a visible `503` instead of leaving incidents apparently
-running behind a green status.
+for the same reason. The configured inference backend is checked on every health request, not only
+during startup; if your Ollama or vLLM process stops, inference becomes a visible `503` instead
+of leaving incidents apparently running behind a green status.
 
 ---
 
@@ -600,10 +602,14 @@ at the device now — together with the policy read back off it.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | For the API running on the host |
+| `INFERENCE_BACKEND` | `ollama` | `ollama` (local Ollama) or `vllm` (self-hosted vLLM/TGI on your network) |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | For the API running on the host when `INFERENCE_BACKEND=ollama` |
 | `OLLAMA_BASE_URL_DOCKER` | `http://host.docker.internal:11434` | Used by the container. Deliberately a separate name, because interpolating the host value into the container points it at itself |
-| `OLLAMA_MODEL` | `gemma4:e4b` | |
-| `OLLAMA_NUM_PREDICT` | `640` | Too low truncates the model mid tool call |
+| `OLLAMA_MODEL` | `gemma4:e4b` | Model name passed to Ollama. Example default only — not required to be Gemma |
+| `VLLM_BASE_URL` | empty | Self-hosted vLLM/TGI base URL when `INFERENCE_BACKEND=vllm`, e.g. `http://gpu-host:8000/v1` |
+| `VLLM_MODEL` | empty | Model id on your vLLM instance; falls back to `OLLAMA_MODEL` if unset |
+| `VLLM_API_KEY` | `EMPTY` | Token if your local server requires one (often `EMPTY` for vLLM) |
+| `OLLAMA_NUM_PREDICT` | `640` | Max tokens per turn. Too low truncates the model mid tool call |
 | `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | `bolt://localhost:7687` / `neo4j` / `zeronode` | |
 | `DATABASE_URL` | `postgresql://...@localhost:5433/zeronode` | Port 5433 to avoid colliding with a local Postgres |
 | `CORS_ORIGINS` | `http://localhost:3000` | |
@@ -651,7 +657,7 @@ at the device now — together with the policy read back off it.
 
 ```bash
 cp .env.example .env
-ollama serve
+# Optional: start Ollama, or set INFERENCE_BACKEND=vllm with self-hosted vLLM/TGI
 docker compose up -d --build            # neo4j, postgres, seed, api, web
 curl -fsS http://localhost:8000/health
 ```
@@ -727,7 +733,8 @@ Being explicit about these matters more than the feature list.
   window, so an incident raised during a freeze waits for a person.
 - **Secret references cover the credentials the API resolves.** `DATABASE_URL` still carries its
   password inline, since it is consumed as a single connection string.
-- **Latency is 6–8 minutes per incident** on CPU inference.
+- **Latency depends on model and backend.** CPU Ollama runs can take several minutes per incident;
+  GPU or a larger model on vLLM is faster. Budgets are enforced via `MODEL_*_BUDGET_SECONDS`.
 
 ---
 
@@ -865,7 +872,7 @@ mutation; live execution skips a rule that already landed and caches the result 
 | --- | --- |
 | ~~Evaluation harness with a corpus of golden incidents~~ | Done: `app/eval/` corpus, scorers, and `python -m app.eval` / `scripts/eval_incidents.py` |
 | ~~Regression gate in CI using the scripted LLM~~ | Done: `.github/workflows/ci.yml` runs ruff, pytest, eval corpus, and `golden_path.py` |
-| ~~GPU inference or a larger model, with latency budgets~~ | Done: `INFERENCE_BACKEND=openai_compatible` for vLLM/GPU; `MODEL_*_BUDGET_SECONDS` enforced in graph/worker |
+| ~~GPU inference or a larger model, with latency budgets~~ | Done: `INFERENCE_BACKEND=vllm` for self-hosted vLLM/GPU; `MODEL_*_BUDGET_SECONDS` enforced in graph/worker |
 | ~~Reduce reliance on the inference fallback to zero~~ | Done: `MODEL_ALLOW_INFERENCE_FALLBACK=false` by default; metrics + `/health`; live gate via `scripts/eval_live.py` |
 
 ### Phase 5 — Scale and coverage
@@ -897,5 +904,5 @@ A pilot is credible when, for a single supported vendor and scenario:
    hardware still required for a customer pilot.
 4. Topology is ingested automatically and its freshness is visible. **Met when NetBox is configured.**
 5. An eval suite gates every deploy, and fallback usage is tracked as a health metric. **Met**
-   (scripted CI corpus; live Ollama eval is a manual release gate).
+   (scripted CI corpus; live model eval against your configured backend is a manual release gate).
 6. A restart never loses an investigation. **Met** (durable jobs + worker).

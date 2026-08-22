@@ -1,9 +1,9 @@
 # ZeroNode
 
-Self-hosted network AI agent: LangGraph + local Gemma (Ollama), Neo4j Graph-RAG, and zero-trust human-in-the-loop. **v0 proves a cross-zone connectivity failure** from alert → specialist → approval gate. Writes are dry-run by default. Execution is opt-in per device, and a change that does not verify against the device afterwards is rolled back automatically. Telemetry stays local unless an operator explicitly enables an outbound ticket or notification webhook.
+Self-hosted network AI agent: LangGraph + pluggable local inference (Ollama or self-hosted vLLM), Neo4j Graph-RAG, and zero-trust human-in-the-loop. **v0 proves a cross-zone connectivity failure** from alert → specialist → approval gate. Writes are dry-run by default. Execution is opt-in per device, and a change that does not verify against the device afterwards is rolled back automatically. Telemetry stays local unless an operator explicitly enables an outbound ticket or notification webhook.
 
 How it works, and what production needs: [docs/how-it-works.md](docs/how-it-works.md)
-How to use it in your work: [docs/using-zeronode.md](docs/using-zeronode.md)
+How to use it in your work (including **before you start**): [docs/using-zeronode.md](docs/using-zeronode.md)
 What remains before production: [docs/roadmap.md](docs/roadmap.md)
 Product thesis: [docs/architecture.md](docs/architecture.md)
 
@@ -34,14 +34,37 @@ Product thesis: [docs/architecture.md](docs/architecture.md)
 - Python 3.11+
 - Node 20+
 - Docker (Neo4j + Postgres)
-- [Ollama](https://ollama.com) on the host, for live inference
+- **Optional:** a live inference server, only if you want the agent to run investigations (not needed for `python scripts/golden_path.py`)
+
+ZeroNode does **not** require Gemma or Ollama. Inference is a pluggable adapter controlled by
+`INFERENCE_BACKEND`. All backends are **self-hosted on your network** — there is no cloud model
+API and no vendor lock-in to a specific model family:
+
+| Backend | When to use | Configure |
+| --- | --- | --- |
+| **`ollama`** (default) | Local CPU/GPU via [Ollama](https://ollama.com) on the host | `INFERENCE_BACKEND=ollama`, `OLLAMA_MODEL=<any model your Ollama serves>` |
+| **`vllm`** | Self-hosted [vLLM](https://docs.vllm.ai/) or TGI on your own GPU host | `INFERENCE_BACKEND=vllm`, `VLLM_BASE_URL`, `VLLM_MODEL` |
+
+Example — Ollama (optional):
 
 ```bash
-ollama pull gemma4:e4b
+ollama pull gemma4:e4b    # example only; any tool-capable model works
 ollama serve
 ```
 
-ZeroNode talks to Ollama via `OLLAMA_MODEL`. Recommended local pick: **`gemma4:e4b`** (best structured tool-calling of the small Gemma 4 family). Fallback if RAM or latency is painful: `batiai/gemma4-e2b:q4`. Skip `gemma:2b` for this agent.
+Example — self-hosted vLLM on your GPU host (optional):
+
+```env
+INFERENCE_BACKEND=vllm
+VLLM_BASE_URL=http://gpu-host:8000/v1
+VLLM_MODEL=your-local-model-id
+VLLM_API_KEY=EMPTY
+```
+
+The model name in `.env.example` (`gemma4:e4b`) is a **default example**, not a requirement. Pick
+any model your backend serves that can follow tool-calling instructions (native `tool_calls` or
+XML-wrapped JSON). Smaller models may hit the state-driven fallback more often; see
+[how-it-works.md](docs/how-it-works.md).
 
 ## Run locally
 
@@ -69,16 +92,19 @@ Approvers need a second factor. After signing in, the dashboard prompts for enro
 to an authenticator app, confirm one code, and sign in again. To run without it — local
 experiments only — set `MFA_REQUIRED_FOR_APPROVERS=false`.
 
-The simplest complete run uses Compose. Ollama remains on the host:
+The simplest complete run uses Compose. Start inference **only if** you want live agent
+investigations; the stack itself (login, dashboard, user management, scripted golden path) runs
+without it:
 
 ```bash
 docker compose up -d --build
 curl -fsS http://localhost:8000/health
 ```
 
-`/health` checks Ollama at request time as well as the durable stores. It returns
-`503` if inference becomes unreachable, so an incident cannot silently remain
-`running` behind a healthy status.
+`/health` checks whichever inference backend is configured (`ollama` or self-hosted `vllm`) as
+well as the durable stores. It returns `503` if inference is configured but unreachable, so an
+incident cannot silently remain `running` behind a healthy status. If you have not started a
+model server yet, use `python scripts/golden_path.py` for a full workflow test without live AI.
 
 For host-based development, start the data stores first:
 
@@ -164,12 +190,12 @@ curl -sS -X POST http://localhost:8000/api/v1/webhooks/generic \
 | `POST /api/v1/webhooks/alertmanager` | Prometheus Alertmanager v4 webhook |
 | `POST /api/v1/webhooks/pagerduty` | PagerDuty v3 incident webhook (HMAC signed) |
 
-### Golden path without Ollama (CI / sanity)
+### Golden path without live inference (CI / sanity)
 
 ```bash
 python scripts/golden_path.py
 python scripts/eval_incidents.py   # score the full golden corpus
-python scripts/eval_live.py        # live model gate (needs Ollama or vLLM)
+python scripts/eval_live.py        # live model gate (needs a configured inference backend)
 cd apps/api && pytest -q -m "not integration"
 scripts/lab_stores_test.sh         # real Postgres + Neo4j integration gate
 ```
@@ -178,7 +204,7 @@ The scripted LLM walks the same tool sequence and asserts interrupt before `exec
 
 ### Full local walkthrough
 
-With the Compose stack and Ollama running, this exercises health, login, MFA
+With the Compose stack and a configured inference backend running, this exercises health, login, MFA
 enrolment, a live-model investigation, HITL approval, dry-run execution and
 signed-ledger verification:
 
@@ -189,7 +215,7 @@ apps/api/.venv/bin/python scripts/e2e_walkthrough.py
 ```
 
 The password is read from the environment so it does not need to be stored in
-the repository. A live Gemma run can take several minutes on CPU.
+the repository. A live investigation on CPU can take several minutes depending on model and backend.
 
 ### Hardware-free test environments
 
@@ -217,9 +243,11 @@ destroys the lab.
 
 ## Docker Compose (API + worker + web)
 
-Ollama stays on the host. The container reads `OLLAMA_BASE_URL_DOCKER` (default
-`host.docker.internal:11434`) rather than `OLLAMA_BASE_URL`, so the host setting in `.env` cannot
-leak in and point the container at itself.
+When using `INFERENCE_BACKEND=ollama`, Ollama typically runs on the host. The container reads
+`OLLAMA_BASE_URL_DOCKER` (default `host.docker.internal:11434`) rather than `OLLAMA_BASE_URL`, so
+the host setting in `.env` cannot leak in and point the container at itself. When using
+`INFERENCE_BACKEND=vllm`, point `VLLM_BASE_URL` at a **self-hosted** vLLM or TGI instance on
+your network — no Ollama required. Everything stays on infrastructure you operate.
 
 ```bash
 docker compose up -d --build
@@ -277,9 +305,9 @@ infra/fakeasa/        device-shaped SSH test server
 infra/containerlab/   three-node Nokia SR Linux lab (public image)
 apps/api/             FastAPI, LangGraph, tools, change simulator, tests
 apps/web/             Next.js HITL dashboard
-scripts/golden_path.py    scripted end-to-end run, no Ollama needed
+scripts/golden_path.py    scripted end-to-end run, no live model needed
 scripts/eval_incidents.py golden incident corpus + scorers (CI gate)
-scripts/eval_live.py       live Ollama/vLLM eval (manual release gate)
+scripts/eval_live.py       live model eval against your configured backend (manual release gate)
 scripts/e2e_walkthrough.py authenticated live-model walkthrough
 scripts/ingest_netbox.py  read NetBox topology into Neo4j
 scripts/lab_device_test.sh run SSH execution tests safely

@@ -1,4 +1,4 @@
-"""Construct the chat model from settings (Ollama or OpenAI-compatible vLLM)."""
+"""Construct the chat model from settings (Ollama or self-hosted vLLM)."""
 
 from __future__ import annotations
 
@@ -18,39 +18,46 @@ def _ollama_llm(settings: Settings) -> BaseChatModel:
     )
 
 
-def _openai_compatible_llm(settings: Settings) -> BaseChatModel:
-    if not settings.openai_compatible_base_url.strip():
+def _vllm_llm(settings: Settings) -> BaseChatModel:
+    if not settings.vllm_base_url.strip():
         raise RuntimeError(
-            "INFERENCE_BACKEND=openai_compatible requires OPENAI_COMPATIBLE_BASE_URL "
-            "(for example http://gpu-host:8000/v1 for vLLM)"
+            "INFERENCE_BACKEND=vllm requires VLLM_BASE_URL "
+            "(for example http://gpu-host:8000/v1 for a self-hosted vLLM server)"
         )
     try:
         from langchain_openai import ChatOpenAI
     except ImportError as exc:  # pragma: no cover - optional until installed
         raise RuntimeError(
-            "INFERENCE_BACKEND=openai_compatible requires langchain-openai "
-            "(pip install langchain-openai)"
+            "INFERENCE_BACKEND=vllm requires the vLLM client extra "
+            "(pip install -e '.[vllm]')"
         ) from exc
 
+    # ChatOpenAI here is the HTTP client vLLM exposes locally — not a cloud API.
     return ChatOpenAI(
-        model=settings.openai_compatible_model or settings.ollama_model,
-        base_url=settings.openai_compatible_base_url.rstrip("/"),
-        api_key=settings.openai_compatible_api_key or "EMPTY",
+        model=settings.vllm_model or settings.ollama_model,
+        base_url=settings.vllm_base_url.rstrip("/"),
+        api_key=settings.vllm_api_key or "EMPTY",
         temperature=0,
         max_tokens=settings.ollama_num_predict,
     )
 
 
+def _normalize_backend(backend: str) -> str:
+    value = (backend or "ollama").strip().lower()
+    if value == "openai_compatible":
+        return "vllm"
+    return value
+
+
 def make_llm(settings: Settings) -> tuple[ResilientChatModel, CircuitBreaker]:
-    backend = (settings.inference_backend or "ollama").strip().lower()
+    backend = _normalize_backend(settings.inference_backend)
     if backend == "ollama":
         inner = _ollama_llm(settings)
-    elif backend in {"openai_compatible", "vllm"}:
-        inner = _openai_compatible_llm(settings)
+    elif backend == "vllm":
+        inner = _vllm_llm(settings)
     else:
         raise RuntimeError(
-            f"Unknown INFERENCE_BACKEND {settings.inference_backend!r}; "
-            "use ollama or openai_compatible"
+            f"Unknown INFERENCE_BACKEND {settings.inference_backend!r}; use ollama or vllm"
         )
 
     circuit = CircuitBreaker(

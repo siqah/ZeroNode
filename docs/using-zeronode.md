@@ -9,6 +9,141 @@ This guide explains how different people use it day to day. For system internals
 
 ---
 
+## Before you start (fresh clone)
+
+ZeroNode is **self-hosted**. Anyone can clone the repo and run it on their own machine, but it is
+not “clone and click”. There is no ZeroNode cloud account, license key, or public sign-up — each
+install is independent. **All components run on infrastructure you control:** Docker services,
+databases, inference (Ollama or vLLM on your network), and device access. Nothing phones home to a
+vendor model API.
+
+Do the steps below **before** `docker compose up`, or the stack will not be usable.
+
+### 1. Install prerequisites
+
+| Requirement | Required? | Notes |
+| --- | --- | --- |
+| **Docker** (with Compose) | Yes | Runs Neo4j, Postgres, API, web, and worker |
+| **Git** | Yes | To clone the repository |
+| **Inference server** (self-hosted Ollama or vLLM on your network) | For live AI investigations only | Not needed for `python scripts/golden_path.py` |
+| Python 3.11+ | For scripts/tests only | Compose runs the app without a local venv |
+
+### Inference (optional — only for live agent runs)
+
+ZeroNode does **not** require Gemma or Ollama. All inference stays **on your network** — there is
+no cloud model API. Pick one self-hosted backend in `.env`:
+
+**Option A — Ollama on the host** (default in `.env.example`):
+
+```env
+INFERENCE_BACKEND=ollama
+OLLAMA_MODEL=gemma4:e4b   # example; use any model your Ollama serves
+```
+
+```bash
+ollama pull gemma4:e4b    # or any tool-capable model you prefer
+ollama serve
+```
+
+**Option B — Self-hosted vLLM or TGI** (your own GPU host — no Ollama):
+
+```env
+INFERENCE_BACKEND=vllm
+VLLM_BASE_URL=http://gpu-host:8000/v1
+VLLM_MODEL=your-local-model-id
+VLLM_API_KEY=EMPTY
+```
+
+The model id is whatever your vLLM instance serves. Install the client with
+`pip install -e "apps/api[vllm]"` when using this backend.
+
+### 2. Copy and edit `.env`
+
+```bash
+git clone https://github.com/siqah/ZeroNode.git
+cd ZeroNode
+cp .env.example .env
+```
+
+The example file ships with an **empty** `BOOTSTRAP_ADMIN_PASSWORD`. You must fill in secrets
+before starting.
+
+**Required** (login will not work without these):
+
+```bash
+# Generate a session signing key
+JWT_SECRET=$(openssl rand -base64 48)
+
+# First admin — created automatically on startup if no users exist yet
+BOOTSTRAP_ADMIN_EMAIL=admin@yourcompany.com
+BOOTSTRAP_ADMIN_PASSWORD=at-least-12-characters
+```
+
+**Strongly recommended** (approvals cannot be verified after a restart without these):
+
+```bash
+# Generate once and paste into .env:
+# cd apps/api && python -m app.audit.keys generate
+AUDIT_SIGNING_KEY=<paste-generated-key>
+AUDIT_ANCHOR_FILE=/var/lib/zeronode/anchors.jsonl
+```
+
+**Optional for local experiments:**
+
+```env
+MFA_REQUIRED_FOR_APPROVERS=false   # skip authenticator enrolment locally
+STRICT_DEPENDENCIES=false          # only if starting API outside Compose before stores are up
+SERVICE_TOKEN=<random-token>       # for webhooks and scripts
+```
+
+Never commit `.env`. Each person who clones sets **their own** bootstrap password.
+
+### 3. Start the stack
+
+```bash
+docker compose up -d --build
+curl -fsS http://localhost:8000/health
+```
+
+If `/health` returns `503`, check which component is degraded (Postgres, Neo4j, worker, or the
+configured inference backend). The API refuses to look healthy while a dependency is down.
+
+After the web image changes (new pages or UI), rebuild the web service:
+
+```bash
+docker compose up -d --build web
+```
+
+### 4. First sign-in and team setup
+
+1. Open **http://localhost:3000/login**
+2. Sign in with `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` from `.env`
+3. Open **http://localhost:3000/admin/users** and create operator and approver accounts
+4. Send each person their email and initial password **outside ZeroNode** (Slack, 1Password, etc.)
+
+See [Accounts: bootstrap, login, and creating users](#accounts-bootstrap-login-and-creating-users)
+below for the full auth flow.
+
+### What works out of the box vs what needs extra config
+
+| Works after the steps above | Needs additional configuration |
+| --- | --- |
+| Login, dashboard, user management | Real production firewall SSH |
+| Seeded lab topology in Neo4j | Your company's inventory / NetBox ingest |
+| Mock firewall backend (default in `.env.example`) | Live device execution |
+| Dry-run approvals (safe default) | `EXECUTION_ENABLED=true` + named device |
+| `python scripts/golden_path.py` (no LLM) | Full live agent path (needs a configured inference backend) |
+
+Default settings are **safe for a fresh clone**: dry-run only, mock firewall, local data only.
+
+### Production is a separate step
+
+Cloning and running locally is not production-ready. Before exposing ZeroNode to a real network,
+also configure TLS (`COOKIE_SECURE=true`), `PRODUCTION_BASELINE=true`, managed secrets, backups, and
+real device credentials. See [runbooks/deploy.md](runbooks/deploy.md).
+
+---
+
 ## What problem it solves
 
 When connectivity breaks across a security zone, an engineer normally:
@@ -38,6 +173,85 @@ ZeroNode has four roles. You sign in at `/login`; alerting systems use a service
 
 **Important:** A monitoring webhook or `SERVICE_TOKEN` can open incidents but can **never**
 approve a change. Approvals always require a human with MFA.
+
+---
+
+## Accounts: bootstrap, login, and creating users
+
+ZeroNode has **no public sign-up page**. Every person account is created by an admin (or by the
+one-time bootstrap on first deploy).
+
+### Step 1 — First admin (bootstrap, once per install)
+
+Before anyone can log in, set these in `.env` and start the stack:
+
+```env
+BOOTSTRAP_ADMIN_EMAIL=admin@yourcompany.com
+BOOTSTRAP_ADMIN_PASSWORD=at-least-12-characters
+```
+
+On startup, if the `users` table is empty, the API creates that account with the **admin** role.
+This happens automatically — you do not register through the UI.
+
+```bash
+docker compose up -d --build
+open http://localhost:3000/login
+```
+
+Sign in with the bootstrap email and password. That person can now create everyone else.
+
+If both bootstrap variables are unset and no users exist, **nobody can log in** and the API logs
+an error on startup.
+
+### Step 2 — Admin creates other users
+
+After the bootstrap admin signs in:
+
+1. Open **http://localhost:3000/admin/users** (also linked as **Users** in the top bar when signed
+   in as admin)
+2. Enter the new person's email, an initial password (12+ characters), and their role
+3. Click **Create user**
+4. Send the email and password to the person **outside ZeroNode** (Slack, 1Password, in person).
+   ZeroNode does not send welcome email or password-reset links.
+
+Alternatively, use the API:
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/auth/users \
+  -H "Content-Type: application/json" \
+  -H "Cookie: zn_session=<admin-session>" \
+  -H "X-CSRF-Token: <csrf-from-login>" \
+  -d '{"email":"noc@example.com","password":"AtLeast12Chars!","role":"operator"}'
+```
+
+| Role | Who gets it | Can sign in | Can approve |
+| --- | --- | --- | --- |
+| `viewer` | Auditor, manager | Yes | No |
+| `operator` | NOC engineer | Yes | No |
+| `approver` | Senior engineer | Yes | Yes (MFA required by default) |
+| `admin` | Platform owner | Yes | Yes + manage users |
+
+### Step 3 — Everyone else signs in
+
+Each person goes to **http://localhost:3000/login** and enters the email and password the admin
+gave them.
+
+- **Wrong password five times** → account locks temporarily. An admin unlocks it at `/admin/users`
+  or waits for the lockout window (`LOGIN_LOCK_MINUTES` in `.env`).
+- **Approvers and admins** → may be prompted to enrol an authenticator (TOTP) before they can
+  approve changes. Controlled by `MFA_REQUIRED_FOR_APPROVERS` (default `true`).
+- **Sessions** → stored in an httpOnly cookie (`zn_session`). Sign out from the top bar.
+
+There is **no self-service password reset** yet. If someone forgets their password, an admin must
+create a new account or you must reset it in Postgres manually.
+
+### What is not a person account
+
+| Credential | Purpose | Signs in at `/login`? |
+| --- | --- | --- |
+| Bootstrap admin email/password | First human admin | Yes |
+| User email/password | NOC, approvers, auditors | Yes |
+| `SERVICE_TOKEN` | Alertmanager, scripts, webhooks | No — bearer token on API only |
 
 ---
 
@@ -183,6 +397,7 @@ The ledger answers: *who approved what, when, with what evidence, and whether th
 | --- | --- |
 | `/login` | Sign in; enrol MFA for approvers |
 | `/dashboard` | Incident list and overview |
+| `/admin/users` | Create users, unlock accounts (admin only) |
 | `/incidents/{thread_id}` | Live investigation, approval gate, execution outcome |
 
 On the incident page you will see:
@@ -204,7 +419,7 @@ ZeroNode fits into a normal NOC stack without replacing it:
 | **ServiceNow / Jira** | Outbound ticket webhook records incident, decision, and outcome |
 | **Slack / Teams / Mattermost** | Notification webhook pings approvers when a change waits at the gate |
 | **NetBox** | Topology ingest keeps Neo4j aligned with inventory (optional) |
-| **Ollama / vLLM** | Local inference — alert and topology data stay on your network |
+| **Inference backend** | Self-hosted Ollama or vLLM on your network — alert and topology data never leave your perimeter |
 
 Nothing leaves your perimeter unless you configure those outbound webhooks.
 
@@ -222,18 +437,23 @@ Nothing leaves your perimeter unless you configure those outbound webhooks.
 
 ## Quick start for a new user
 
+If you have already completed [Before you start (fresh clone)](#before-you-start-fresh-clone):
+
 ```bash
-# 1. Start the stack
-cp .env.example .env   # edit secrets and bootstrap admin
+# 1. Start the stack and bootstrap the first admin
+cp .env.example .env   # set BOOTSTRAP_ADMIN_EMAIL/PASSWORD and other secrets
 docker compose up -d --build
 
-# 2. Sign in
+# 2. Sign in as bootstrap admin
 open http://localhost:3000/login
 
-# 3. Trigger a test incident (as operator)
-ZERONODE_PASSWORD='your-password' ./scripts/trigger_golden_alert.sh
+# 3. Create NOC and approver accounts
+open http://localhost:3000/admin/users
 
-# 4. Review and approve
+# 4. Trigger a test incident (as operator)
+ZERONODE_PASSWORD='your-bootstrap-password' ./scripts/trigger_golden_alert.sh
+
+# 5. Review and approve (as approver)
 open http://localhost:3000/incidents/INC-1001
 ```
 

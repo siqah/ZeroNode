@@ -22,11 +22,11 @@ class Settings(BaseSettings):
     topology_replace_on_ingest: bool = True
     topology_ingest_interval_seconds: int = 3600
     topology_stale_seconds: float = 86400.0
-    # Inference backend: local Ollama or an OpenAI-compatible GPU server (vLLM).
-    inference_backend: str = "ollama"  # ollama | openai_compatible
-    openai_compatible_base_url: str = ""
-    openai_compatible_api_key: str = "EMPTY"
-    openai_compatible_model: str = ""
+    # Inference backend: local Ollama or self-hosted vLLM/TGI on your network.
+    inference_backend: str = "ollama"  # ollama | vllm
+    vllm_base_url: str = ""
+    vllm_api_key: str = "EMPTY"
+    vllm_model: str = ""
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "zeronode"

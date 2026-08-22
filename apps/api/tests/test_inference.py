@@ -15,9 +15,9 @@ def test_make_llm_ollama_backend():
     assert circuit.failure_threshold == settings.model_circuit_failures
 
 
-def test_make_llm_openai_compatible_requires_base_url():
-    settings = Settings(inference_backend="openai_compatible")
-    with pytest.raises(RuntimeError, match="OPENAI_COMPATIBLE_BASE_URL"):
+def test_make_llm_vllm_requires_base_url():
+    settings = Settings(inference_backend="vllm")
+    with pytest.raises(RuntimeError, match="VLLM_BASE_URL"):
         make_llm(settings)
 
 

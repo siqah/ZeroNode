@@ -10,8 +10,8 @@
 | Webhook `401` on PagerDuty | Bad HMAC secret | Rotate `PAGERDUTY_WEBHOOK_SECRET` and update PagerDuty subscription |
 | `topology: stale` | NetBox ingest lag | Check `NETBOX_*` env; run `scripts/ingest_netbox.py --dry-run` |
 | `worker: no live investigation worker heartbeat` | Worker down | `docker compose logs worker`; restart worker service |
-| `queue: saturated` | Job backlog | Raise `WORKER_CONCURRENCY` or scale workers; check Ollama latency |
-| `inference: circuit_open` | Model failures | Check Ollama/vLLM; inspect `zeronode_model_calls_total` |
+| `queue: saturated` | Job backlog | Raise `WORKER_CONCURRENCY` or scale workers; check inference latency |
+| `inference: circuit_open` | Model failures | Check your configured backend (Ollama or self-hosted vLLM); inspect `zeronode_model_calls_total` |
 | Incident stuck `running` | Job lease / graph error | `GET /api/v1/incidents/{id}/status`; check worker logs for thread_id |
 | `rollback_failed` on incident | Device write issue | **Do not re-approve**; manual device remediation per change ticket |
 
