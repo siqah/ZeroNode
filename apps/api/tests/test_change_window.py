@@ -32,6 +32,9 @@ def client():
     app.state.keyset = KeySet(Signer(Signer.generate_seed()))
     app.state.anchor_sink = NullAnchorSink()
     app.state.schedule = ALWAYS_FROZEN
+    from app.jobs.dispatcher import InMemoryDispatcher
+
+    app.state.dispatcher = InMemoryDispatcher()
     with TestClient(app) as test_client:
         yield test_client
 

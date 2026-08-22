@@ -42,6 +42,7 @@ def session_factory(backend: str) -> Callable[[str], ConfigSession]:
             device_type=device_type,
             device_id=device_id,
             secret=secret,
+            port=settings.firewall_port,
         )
 
     return build

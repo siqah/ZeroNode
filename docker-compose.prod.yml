@@ -1,0 +1,46 @@
+# Production-oriented overrides. Use with the base compose file:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Set secrets via .env or your secret manager; do not commit production credentials.
+
+services:
+  neo4j:
+    image: ${NEO4J_IMAGE:-neo4j:5.26-community}
+    ports: []  # keep graph DB off the host perimeter
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    ports: []
+
+  api:
+    restart: unless-stopped
+    environment:
+      LOG_JSON: "true"
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      STRICT_DEPENDENCIES: "true"
+      REQUIRE_MANAGED_SECRETS: ${REQUIRE_MANAGED_SECRETS:-true}
+      PRODUCTION_BASELINE: "true"
+      AUTH_ENABLED: "true"
+      MFA_REQUIRED_FOR_APPROVERS: "true"
+      MODEL_ALLOW_INFERENCE_FALLBACK: "false"
+      WORKER_EMBEDDED: "false"
+      AUDIT_ANCHOR_FILE: /var/lib/zeronode/anchors.jsonl
+      WEBHOOKS_ENABLED: "true"
+
+  worker:
+    restart: unless-stopped
+    environment:
+      LOG_JSON: "true"
+      STRICT_DEPENDENCIES: "true"
+      REQUIRE_MANAGED_SECRETS: ${REQUIRE_MANAGED_SECRETS:-true}
+      PRODUCTION_BASELINE: "true"
+      AUTH_ENABLED: "true"
+      MFA_REQUIRED_FOR_APPROVERS: "true"
+      MODEL_ALLOW_INFERENCE_FALLBACK: "false"
+      WORKER_EMBEDDED: "false"
+      AUDIT_ANCHOR_FILE: /var/lib/zeronode/anchors.jsonl
+
+  web:
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${DASHBOARD_API_URL:-http://localhost:8000}

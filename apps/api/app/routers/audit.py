@@ -58,15 +58,18 @@ async def verify(request: Request, _: Principal = Depends(require_role(Role.VIEW
     trusted = keyset.trusted
     report = verify_chain(rows, trusted)
     anchor = check_against_anchor(rows, sink.latest(), trusted)
+    protected = anchor.ok and anchor.anchor_present
     return {
-        "ok": report.ok and anchor.ok,
+        "ok": report.ok and protected,
         "chain_ok": report.ok,
+        "protected": protected,
         "records_checked": report.checked,
         "broken_at": report.broken_at,
         "reason": report.reason or anchor.reason,
         "anchor": {
             "ok": anchor.ok,
             "present": anchor.anchor_present,
+            "protected": protected,
             "sink": sink.describe(),
             "anchored_count": anchor.anchored_count,
             "anchored_head": anchor.anchored_head,

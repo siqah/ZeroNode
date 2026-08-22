@@ -98,8 +98,31 @@ def client():
     app.state.anchor_sink = NullAnchorSink()
     app.state.tickets = Recorder()
     app.state.notifier = Recorder()
+    from app.jobs.dispatcher import InMemoryDispatcher
+    from app.jobs.runner import InvestigationRunner
+
+    dispatcher = InMemoryDispatcher()
+    app.state.dispatcher = dispatcher
+
+    async def drain() -> None:
+        runner = InvestigationRunner(app.state)
+        while True:
+            job = await dispatcher.claim("test-worker", lease_seconds=60)
+            if job is None:
+                return
+            try:
+                await runner.run_job(job)
+                await dispatcher.complete(job.id)
+            except Exception as exc:  # noqa: BLE001
+                await dispatcher.fail(job, error=str(exc), retry_delay_seconds=0)
+
+    app.state.drain_jobs = drain
     with TestClient(app) as test_client:
         yield test_client
+
+
+def drain(client) -> None:
+    asyncio.run(client.app.state.drain_jobs())
 
 
 def test_the_pending_message_carries_what_a_decision_needs():
@@ -156,6 +179,7 @@ def test_every_proposal_is_notified_not_just_the_first(client):
     client.post(
         "/api/v1/incidents/INC-1/resume", json={"decision": "reject", "feedback": "narrow it"}
     )
+    drain(client)
 
     told = settle(lambda: any(kind == "notify" for kind, _ in client.app.state.notifier.events))
     assert told, "the re-proposal reached the gate with nobody told"
@@ -167,6 +191,7 @@ def test_a_finished_incident_closes_its_ticket(client):
     client.app.state.graph.next_after_resume = ()
 
     client.post("/api/v1/incidents/INC-1/resume", json={"decision": "approve"})
+    drain(client)
 
     assert settle(lambda: any(kind == "closed" for kind, _ in client.app.state.tickets.events))
 
@@ -174,6 +199,42 @@ def test_a_finished_incident_closes_its_ticket(client):
 def test_a_dead_webhook_never_raises():
     """An outage in chat must not become an outage in the workflow."""
     assert asyncio.run(post_json("http://127.0.0.1:1/hook", {"text": "hello"})) is False
+
+
+def test_transient_webhook_failures_are_retried(monkeypatch):
+    calls = {"count": 0}
+
+    class FakeResponse:
+        status_code = 503
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                return FakeResponse()
+            ok = FakeResponse()
+            ok.status_code = 200
+            return ok
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+
+    assert asyncio.run(
+        post_json(
+            "https://hooks.example/hook",
+            {"text": "hello"},
+            max_retries=2,
+            retry_backoff_seconds=0,
+        )
+    )
+    assert calls["count"] == 3
 
 
 def test_only_the_host_of_a_webhook_url_is_ever_logged():

@@ -67,6 +67,11 @@ def main() -> int:
         default=os.environ.get("ZERONODE_PASSWORD", ""),
         help="Prefer ZERONODE_PASSWORD so the password does not enter shell history.",
     )
+    parser.add_argument(
+        "--totp",
+        default=os.environ.get("ZERONODE_TOTP", ""),
+        help="Current TOTP code when MFA is already enrolled (or ZERONODE_TOTP).",
+    )
     parser.add_argument("--decision", default="approve", choices=["approve", "reject"])
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
@@ -82,11 +87,14 @@ def main() -> int:
         print(f"    {name}: {value}")
 
     step("Login")
-    status, body = client.call(
-        "/api/v1/auth/login", {"email": args.email, "password": args.password}
-    )
+    login_payload = {"email": args.email, "password": args.password}
+    if args.totp:
+        login_payload["totp_code"] = args.totp
+    status, body = client.call("/api/v1/auth/login", login_payload)
     if status != 200:
         print(f"  failed: {status} {body}")
+        if status == 401 and body.get("detail") == "mfa_required":
+            print("  Hint: pass --totp / ZERONODE_TOTP for an enrolled account.")
         return 1
     client.csrf = body.get("csrf_token", "")
     print(f"  {body['email']} as {body['role']}, mfa={body.get('mfa')}")

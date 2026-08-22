@@ -17,6 +17,7 @@ from app.execute.base import (
 )
 from app.execute.device import DeviceExecutor
 from app.execute.dryrun import DryRunExecutor
+from app.execute.idempotent import IdempotentDeviceExecutor
 from app.execute.session import ConfigSession, UnsafeCommand
 from app.firewall.base import FirewallStore
 
@@ -34,6 +35,7 @@ __all__ = [
     "ExecutionResult",
     "ExecutionStep",
     "Executor",
+    "IdempotentDeviceExecutor",
     "UnsafeCommand",
     "make_executor",
 ]
@@ -71,7 +73,7 @@ def make_executor(firewall: FirewallStore) -> Executor:
         "LIVE EXECUTION IS ENABLED for %s. Approved changes will be written to hardware.",
         ", ".join(sorted(devices)),
     )
-    return DeviceExecutor(
+    return IdempotentDeviceExecutor(
         firewall,
         session_factory(backend),
         devices=devices,

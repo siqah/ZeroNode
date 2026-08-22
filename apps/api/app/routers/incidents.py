@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from app.audit import store as audit_store
 from app.auth.deps import require_role
 from app.auth.models import Principal, Role
-from app.config import settings
-from app.outbound import NullNotifier, NullTicketSink, pending_approval_message
-from app.sanitize import fence_alert, sanitize
+from app.ingress.models import NormalizedIncidentTrigger
+from app.ingress.trigger import trigger_incident
+from app.jobs.dispatcher import QueueFull
+from app.jobs.runner import thread_config
+from app.outbound import NullTicketSink
 from app.schedule import ChangeSchedule
 from app.store import incidents as incident_store
 
@@ -26,6 +27,7 @@ class TriggerBody(BaseModel):
     ticket_id: str = Field(pattern=r"^[A-Za-z0-9._:-]+$", min_length=1)
     description: str = Field(min_length=1)
     severity: Literal["low", "medium", "high", "critical"] = "high"
+    site: str = Field(default="", max_length=128)
 
 
 class ResumeBody(BaseModel):
@@ -37,15 +39,11 @@ class ResumeBody(BaseModel):
     override_reason: str = ""
 
 
-def _thread_config(thread_id: str) -> dict[str, Any]:
-    return {"configurable": {"thread_id": thread_id}, "recursion_limit": 16}
-
-
 def _status_from_snapshot(values: dict, nxt: tuple) -> str:
     if "execute_change" in nxt:
         return "awaiting_approval"
     summary = (values.get("findings_summary") or "") if values else ""
-    if summary.startswith("DRY-RUN"):
+    if summary.startswith("DRY-RUN") or summary.startswith("APPLIED"):
         return "resolved"
     if nxt:
         return "running"
@@ -54,102 +52,69 @@ def _status_from_snapshot(values: dict, nxt: tuple) -> str:
     return "queued"
 
 
+def _dispatcher(request: Request):
+    dispatcher = getattr(request.app.state, "dispatcher", None)
+    if dispatcher is None:
+        raise HTTPException(
+            status_code=503, detail="Investigation queue unavailable"
+        )
+    return dispatcher
+
+
+async def _durable_error(request: Request, thread_id: str) -> str:
+    dispatcher = getattr(request.app.state, "dispatcher", None)
+    if dispatcher is None:
+        return getattr(request.app.state, "graph_failures", {}).get(thread_id, "")
+    return await dispatcher.latest_error(thread_id) or getattr(
+        request.app.state, "graph_failures", {}
+    ).get(thread_id, "")
+
+
 @router.post("/incidents/trigger")
 async def trigger_investigation(
     body: TriggerBody,
     request: Request,
     principal: Principal = Depends(require_role(Role.OPERATOR)),
 ):
-    graph = request.app.state.graph
-    pool = request.app.state.pool
-    config = _thread_config(body.ticket_id)
-
-    # A webhook body is attacker-influenced text that lands in the same context
-    # as the system prompt, so it is cleaned and fenced before the agent sees it.
-    description, flags = sanitize(body.description)
-    if flags:
-        logger.warning(
-            "incident %s: alert text flagged (%s) from %s",
-            body.ticket_id,
-            ", ".join(flags),
-            principal.subject,
-        )
-
-    initial = {
-        "messages": [("user", fence_alert(description))],
-        "alert_flags": flags,
-        "incident_id": body.ticket_id,
-        "active_worker": "",
-        "findings_summary": "",
-        "pending_actions": [],
-        "topology_context": "",
-        "zone_context": "",
-        "denied_flows": [],
-        "verification": [],
-        "verify_attempts": 0,
-        "reasoning_trace": [],
-        "tool_log": [],
-        "task_brief": "",
-        "human_decision": "",
-        "human_feedback": "",
-        "human_actor": "",
+    trigger = NormalizedIncidentTrigger(
+        thread_id=body.ticket_id,
+        description=body.description,
+        severity=body.severity,
+        site=body.site.strip(),
+        source="api",
+    )
+    result = await trigger_incident(request, trigger, principal=principal)
+    return {
+        "status": result.status,
+        "thread_id": result.thread_id,
+        "job_id": result.job_id,
+        "deduped": result.deduped,
+        "source": result.source,
     }
-    if pool is not None:
-        async with pool.connection() as conn:
-            await incident_store.ensure_incidents_table(conn)
-            await incident_store.insert_incident(
-                conn, body.ticket_id, body.description, body.severity
-            )
-    else:
-        request.app.state.memory_incidents[body.ticket_id] = {
-            "thread_id": body.ticket_id,
-            "description": body.description,
-            "severity": body.severity,
-            "created_at": None,
-        }
-
-    async def _run() -> None:
-        try:
-            await graph.ainvoke(initial, config)
-        except Exception as exc:
-            logger.exception("graph failed for %s", body.ticket_id)
-            failures = getattr(request.app.state, "graph_failures", None)
-            if failures is None:
-                failures = {}
-                request.app.state.graph_failures = failures
-            failures[body.ticket_id] = str(exc)
-            return
-        getattr(request.app.state, "graph_failures", {}).pop(body.ticket_id, None)
-        await _notify_if_waiting(request, body.ticket_id)
-        await _close_if_finished(request, body.ticket_id)
-
-    await _tickets(request).opened(body.ticket_id, description, body.severity)
-    asyncio.create_task(_run())
-    logger.info("incident %s triggered by %s", body.ticket_id, principal.subject)
-    return {"status": "Agent dispatched", "thread_id": body.ticket_id}
 
 
 @router.get("/incidents")
 async def list_incidents(
-    request: Request, _: Principal = Depends(require_role(Role.VIEWER))
+    request: Request,
+    site: str = "",
+    _: Principal = Depends(require_role(Role.VIEWER)),
 ):
     graph = request.app.state.graph
     pool = request.app.state.pool
+    site_filter = site.strip()
     if pool is not None:
         async with pool.connection() as conn:
             await incident_store.ensure_incidents_table(conn)
-            rows = await incident_store.list_incidents(conn)
+            rows = await incident_store.list_incidents(conn, site=site_filter)
     else:
         rows = list(request.app.state.memory_incidents.values())
 
     enriched = []
     for row in rows:
-        snapshot = await graph.aget_state(_thread_config(row["thread_id"]))
+        snapshot = await graph.aget_state(thread_config(row["thread_id"]))
         values = snapshot.values or {}
         nxt = tuple(snapshot.next or ())
-        failure = getattr(request.app.state, "graph_failures", {}).get(
-            row["thread_id"], ""
-        )
+        failure = await _durable_error(request, row["thread_id"])
         enriched.append(
             {
                 **row,
@@ -165,10 +130,10 @@ async def get_incident_status(
     thread_id: str, request: Request, _: Principal = Depends(require_role(Role.VIEWER))
 ):
     graph = request.app.state.graph
-    snapshot = await graph.aget_state(_thread_config(thread_id))
+    snapshot = await graph.aget_state(thread_config(thread_id))
     values = snapshot.values or {}
     nxt = tuple(snapshot.next or ())
-    failure = getattr(request.app.state, "graph_failures", {}).get(thread_id, "")
+    failure = await _durable_error(request, thread_id)
     if not values and not nxt:
         if failure:
             return {
@@ -211,60 +176,8 @@ async def get_incident_status(
 
 
 def _execution_mode(request: Request) -> str:
-    """Whether approving means "logged" or "written to hardware"."""
     executor = getattr(request.app.state, "executor", None)
     return executor.describe() if executor else "dry-run (no device is contacted)"
-
-
-def _tickets(request: Request):
-    return getattr(request.app.state, "tickets", None) or NullTicketSink()
-
-
-def _notifier(request: Request):
-    return getattr(request.app.state, "notifier", None) or NullNotifier()
-
-
-async def _notify_if_waiting(request: Request, thread_id: str) -> None:
-    """Tell someone, once the graph has actually stopped at the gate.
-
-    Fired after the run returns rather than from inside the node, because until
-    the graph pauses there is nothing for a person to act on, and an alert that
-    arrives before the proposal exists trains people to ignore alerts.
-    """
-    snapshot = await request.app.state.graph.aget_state(_thread_config(thread_id))
-    if "execute_change" not in tuple(snapshot.next or ()):
-        return
-
-    values = snapshot.values or {}
-    window = _schedule(request).evaluate()
-    text = pending_approval_message(
-        thread_id,
-        values.get("pending_actions") or [],
-        settings.dashboard_url,
-        window_reason="" if window.open else window.reason,
-        alert_flags=values.get("alert_flags") or [],
-    )
-    await _notifier(request).send(text, {"incident": thread_id, "event": "approval.pending"})
-    await _tickets(request).commented(
-        thread_id, text, {"event": "approval.pending", "state": "awaiting_approval"}
-    )
-
-
-async def _close_if_finished(request: Request, thread_id: str) -> None:
-    """Close the ticket when the incident actually ends.
-
-    An integration that opens tickets and never closes them is worse than no
-    integration: it teaches people that the queue is noise.
-    """
-    snapshot = await request.app.state.graph.aget_state(_thread_config(thread_id))
-    if tuple(snapshot.next or ()):
-        return
-
-    values = snapshot.values or {}
-    await _tickets(request).closed(
-        thread_id,
-        values.get("findings_summary") or "The investigation finished with no summary.",
-    )
 
 
 def _schedule(request: Request) -> ChangeSchedule:
@@ -272,7 +185,6 @@ def _schedule(request: Request) -> ChangeSchedule:
 
 
 def _window_state(request: Request) -> dict[str, Any]:
-    """Shown alongside the proposal so the window is visible before, not after."""
     schedule = _schedule(request)
     decision = schedule.evaluate()
     return {
@@ -283,55 +195,6 @@ def _window_state(request: Request) -> dict[str, Any]:
     }
 
 
-async def _record_execution(request: Request, thread_id: str, principal: Principal) -> None:
-    """Seal what execution actually did into the same chain as the approval.
-
-    The approval says what a person agreed to; this says what the system then
-    did with it. Recording only the first would leave the more consequential
-    half of the story outside the audit trail.
-    """
-    pool = getattr(request.app.state, "pool", None)
-    if pool is None:
-        return
-
-    snapshot = await request.app.state.graph.aget_state(_thread_config(thread_id))
-    execution = (snapshot.values or {}).get("execution")
-    if not execution or execution.get("state") == "logged":
-        # A dry run is already fully described by the approval record.
-        return
-
-    try:
-        async with pool.connection() as conn:
-            await audit_store.append_approval(
-                conn,
-                request.app.state.keyset.active,
-                thread_id=thread_id,
-                decision=f"execution:{execution.get('state')}",
-                feedback="",
-                actor="system",
-                actor_role="system",
-                evidence={"execution": execution, "on_behalf_of": principal.subject},
-                sink=request.app.state.anchor_sink,
-            )
-    except Exception:
-        logger.exception("could not record the execution of %s", thread_id)
-
-    state = str(execution.get("state"))
-    narrative = " ".join(execution.get("lines") or []) or state
-    await _tickets(request).commented(
-        thread_id, f"Execution {state}: {narrative}", {"event": f"execution.{state}"}
-    )
-
-    if state in ("rollback_failed", "refused"):
-        # The two outcomes a person has to know about immediately: a device left
-        # in a state nobody chose, and an approval that quietly did nothing.
-        logger.error("%s on %s: %s", state, thread_id, narrative)
-        await _notifier(request).send(
-            f"ZeroNode {thread_id}: execution {state}. {narrative}",
-            {"incident": thread_id, "event": f"execution.{state}"},
-        )
-
-
 @router.post("/incidents/{thread_id}/resume")
 async def resume_investigation(
     thread_id: str,
@@ -340,7 +203,8 @@ async def resume_investigation(
     principal: Principal = Depends(require_role(Role.APPROVER, human_only=True, mfa=True)),
 ):
     graph = request.app.state.graph
-    config = _thread_config(thread_id)
+    dispatcher = _dispatcher(request)
+    config = thread_config(thread_id)
     snapshot = await graph.aget_state(config)
     nxt = tuple(snapshot.next or ())
     if "execute_change" not in nxt:
@@ -349,7 +213,6 @@ async def resume_investigation(
             detail="Incident is not awaiting approval",
         )
 
-    # Rejecting is always safe, so only approvals answer to the change window.
     window = _schedule(request).evaluate()
     override: dict[str, Any] | None = None
     if body.decision == "approve" and not window.open:
@@ -394,6 +257,7 @@ async def resume_investigation(
 
     pool = getattr(request.app.state, "pool", None)
     receipt: dict[str, Any] | None = None
+    approval_hash = ""
     if pool is not None:
         async with pool.connection() as conn:
             await audit_store.ensure_approvals_table(conn)
@@ -408,52 +272,55 @@ async def resume_investigation(
                 evidence=evidence,
                 sink=request.app.state.anchor_sink,
             )
+            metrics = getattr(request.app.state, "metrics", None)
+            if metrics is not None:
+                created_at = await incident_store.get_created_at(conn, thread_id)
+                if created_at is not None:
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=UTC)
+                    latency = max(
+                        0.0,
+                        (datetime.now(UTC) - created_at).total_seconds(),
+                    )
+                    metrics.observe_approval_latency(latency)
+        approval_hash = sealed.hash
         receipt = {
             "hash": sealed.hash,
             "key_id": sealed.key_id,
             "recorded_at": sealed.record.created_at,
         }
     elif getattr(request.app.state, "auth_enabled", True):
-        # An approval that cannot be recorded is an approval nobody can be held to.
         raise HTTPException(
             status_code=503,
             detail="Approval ledger unavailable; refusing to act on an unrecorded decision",
         )
     else:
+        approval_hash = f"memory:{thread_id}:{body.decision}"
         logger.warning(
             "auth disabled and no ledger: %s on %s is NOT being recorded",
             body.decision,
             thread_id,
         )
 
-    async def _run() -> None:
-        try:
-            await graph.ainvoke(
-                Command(
-                    resume=True,
-                    update={
-                        "human_decision": body.decision,
-                        "human_feedback": body.feedback,
-                        "human_actor": principal.subject,
-                    },
-                ),
-                config,
-            )
-        except Exception:
-            logger.exception("resume failed for %s", thread_id)
-            return
-        await _record_execution(request, thread_id, principal)
-        # A rejection sends the specialist back to re-plan, and the revised
-        # proposal stops at the same gate. Without this, every proposal after
-        # the first is silent, which is the point at which people stop trusting
-        # the notification.
-        await _notify_if_waiting(request, thread_id)
-        await _close_if_finished(request, thread_id)
+    try:
+        job_id = await dispatcher.enqueue_resume(
+            thread_id,
+            approval_hash=approval_hash,
+            payload={
+                "decision": body.decision,
+                "feedback": body.feedback,
+                "actor": principal.subject,
+                "actor_role": principal.role.value,
+                "operation_key": approval_hash,
+            },
+        )
+    except QueueFull as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    asyncio.create_task(_run())
     verb = "approved" if body.decision == "approve" else "rejected"
-    logger.info("%s %s %s", principal.subject, verb, thread_id)
-    await _tickets(request).commented(
+    logger.info("%s %s %s (job %s)", principal.subject, verb, thread_id, job_id)
+    tickets = getattr(request.app.state, "tickets", None) or NullTicketSink()
+    await tickets.commented(
         thread_id,
         f"{principal.subject} {verb} the proposed change."
         + (f" Note: {body.feedback}" if body.feedback else "")
@@ -465,4 +332,5 @@ async def resume_investigation(
         "status": f"Graph resumed with decision: {body.decision}",
         "actor": principal.subject,
         "receipt": receipt,
+        "job_id": job_id,
     }

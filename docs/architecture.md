@@ -145,8 +145,9 @@ Golden trigger: `{ "ticket_id": "INC-1001", "description": "Web_App cannot reach
 - Agent identity / PKI
 - 100k-device scale
 
-The next reliability work is a durable job runner, model timeouts and retries,
-backpressure, observability, backup/restore drills and CI regression gates.
+The numbered production roadmap (Phases 1–6) is complete. Follow-on work is
+operational hardening on real hardware (LLDP/SNMP, BGP specialists, production
+device pilots) rather than new phase items.
 
 ---
 

@@ -25,6 +25,7 @@ from psycopg_pool import AsyncConnectionPool  # noqa: E402
 
 from app.audit.store import ensure_approvals_table  # noqa: E402
 from app.auth.store import ensure_users_table  # noqa: E402
+from app.jobs.store import ensure_jobs_tables  # noqa: E402
 from app.store.incidents import ensure_incidents_table  # noqa: E402
 
 DSN = os.environ.get(
@@ -41,7 +42,10 @@ def reachable() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not reachable(), reason=f"no postgres at {DSN}")
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not reachable(), reason=f"no postgres at {DSN}"),
+]
 
 
 @pytest.fixture
@@ -65,6 +69,7 @@ async def test_the_schema_can_be_created_on_a_pooled_connection(pool):
         await ensure_users_table(conn)
         await ensure_approvals_table(conn)
         await ensure_incidents_table(conn)
+        await ensure_jobs_tables(conn)
 
 
 async def test_running_setup_twice_is_harmless(pool):

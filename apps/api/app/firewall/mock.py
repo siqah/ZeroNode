@@ -59,8 +59,22 @@ ACL_HITS: list[dict[str, Any]] = [
 class MockFirewall:
     """Static lab policy. The one piece of the system that is not real."""
 
+    def __init__(
+        self,
+        *,
+        denied_flows: list[dict[str, Any]] | None = None,
+        acl_hits: list[dict[str, Any]] | None = None,
+        platform: str = "cisco_asa",
+    ) -> None:
+        self._denied_flows = denied_flows if denied_flows is not None else DENIED_FLOWS
+        self._acl_hits = acl_hits if acl_hits is not None else ACL_HITS
+        self._platform = platform
+
+    def platform(self) -> str:
+        return self._platform
+
     def describe(self) -> str:
-        return "mock fixtures (no device contacted)"
+        return f"mock fixtures ({self._platform}, no device contacted)"
 
     def refresh(self, device_id: str) -> None:
         """Fixtures are read fresh every time."""
@@ -78,7 +92,7 @@ class MockFirewall:
                 hits=int(row.get("hits", 0)),
                 acl=str(row.get("acl", "")),
             )
-            for row in ACL_HITS
+            for row in self._acl_hits
             if row["device"] == device_id
         ]
         return sorted(rules, key=lambda rule: rule.line)
@@ -86,7 +100,7 @@ class MockFirewall:
     def denied_flows(self, query: FlowQuery) -> list[dict[str, Any]]:
         rows = [
             row
-            for row in DENIED_FLOWS
+            for row in self._denied_flows
             if row["src_device"] == query.source_device
             and row["dst_device"] == query.target_device
         ]
@@ -97,7 +111,7 @@ class MockFirewall:
         return NatAssessment()
 
     def acl_hits(self, device_id: str, rule_id: str | None = None) -> list[dict[str, Any]]:
-        rows = [row for row in ACL_HITS if row["device"] == device_id]
+        rows = [row for row in self._acl_hits if row["device"] == device_id]
         if rule_id:
             rows = [row for row in rows if row["rule_id"] == rule_id]
         return [minify_payload(row) for row in rows]

@@ -104,6 +104,9 @@ def client():
     app.state.mfa_required_for_approvers = True
     app.state.keyset = KeySet(Signer(Signer.generate_seed()))
     app.state.anchor_sink = NullAnchorSink()
+    from app.jobs.dispatcher import InMemoryDispatcher
+
+    app.state.dispatcher = InMemoryDispatcher()
     with TestClient(app) as test_client:
         yield test_client
 
@@ -120,6 +123,9 @@ def test_a_poisoned_alert_is_accepted_but_flagged(client):
     )
     assert response.status_code == 200
 
-    status = client.get("/api/v1/incidents/INC-9/status", headers=auth(Role.VIEWER)).json()
-    assert "instruction override" in status["alert_flags"]
-    assert "over-broad change request" in status["alert_flags"]
+    # Flags are sealed into the durable start payload before a worker runs.
+    jobs = list(client.app.state.dispatcher._jobs.values())
+    assert len(jobs) == 1
+    flags = jobs[0].payload["initial"]["alert_flags"]
+    assert "instruction override" in flags
+    assert "over-broad change request" in flags

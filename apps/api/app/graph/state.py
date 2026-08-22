@@ -9,6 +9,19 @@ def append_trace(left: list[str] | None, right: list[str] | None) -> list[str]:
     return (left or []) + (right or [])
 
 
+def add_elapsed(left: float | None, right: float | None) -> float:
+    return (left or 0.0) + (right or 0.0)
+
+
+def merge_node_seconds(
+    left: dict[str, float] | None, right: dict[str, float] | None
+) -> dict[str, float]:
+    merged = dict(left or {})
+    for key, value in (right or {}).items():
+        merged[key] = merged.get(key, 0.0) + float(value)
+    return merged
+
+
 class NetworkAgentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     incident_id: str
@@ -30,3 +43,10 @@ class NetworkAgentState(TypedDict, total=False):
     human_decision: str
     human_feedback: str
     human_actor: str
+    # Approval ledger hash; makes resume/execution replay-safe across workers.
+    operation_key: str
+    # Optional site scope for multi-site inventories (Phase 5).
+    topology_site: str
+    # Cumulative model wall time for latency budgets (Phase 4).
+    model_elapsed_seconds: Annotated[float, add_elapsed]
+    model_seconds_by_node: Annotated[dict[str, float], merge_node_seconds]

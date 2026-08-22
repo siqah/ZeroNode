@@ -3,6 +3,8 @@
 Self-hosted network AI agent: LangGraph + local Gemma (Ollama), Neo4j Graph-RAG, and zero-trust human-in-the-loop. **v0 proves a cross-zone connectivity failure** from alert → specialist → approval gate. Writes are dry-run by default. Execution is opt-in per device, and a change that does not verify against the device afterwards is rolled back automatically. Telemetry stays local unless an operator explicitly enables an outbound ticket or notification webhook.
 
 How it works, and what production needs: [docs/how-it-works.md](docs/how-it-works.md)
+How to use it in your work: [docs/using-zeronode.md](docs/using-zeronode.md)
+What remains before production: [docs/roadmap.md](docs/roadmap.md)
 Product thesis: [docs/architecture.md](docs/architecture.md)
 
 ## What v0 does
@@ -24,6 +26,8 @@ Product thesis: [docs/architecture.md](docs/architecture.md)
 - An executed change is read back off the device, and if the flow is not actually permitted it is rolled back automatically. A rollback that itself fails is a loud terminal state, not a log line
 - Pending approvals go to a Slack, Teams or Mattermost webhook, and incidents, decisions and execution outcomes are written back to a ServiceNow or Jira endpoint
 - Credentials can point at a secret manager (`file:`, `env:`, `vault:`, `exec:`) instead of holding a value, and an unreachable store fails startup rather than quietly swapping in fixtures
+- Inbound alert webhooks normalize generic, Prometheus Alertmanager v4, and PagerDuty v3 payloads into the same trigger path as manual incidents, with rate limits, deduplication, and signature verification
+- Production baseline mode (`PRODUCTION_BASELINE=true`) fails closed on missing auth, JWT, audit key, external anchor, TLS cookies, strict dependencies, or embedded worker mode
 
 ## Prerequisites
 
@@ -141,11 +145,33 @@ The device password may not be an inline value: point it at a secret manager, fo
 `exec:<command>`. It is resolved when a session opens and cached for `SECRET_CACHE_SECONDS`, so
 rotating at the source needs no restart. `REQUIRE_MANAGED_SECRETS=false` accepts the risk.
 
+### Inbound alert webhooks
+
+All webhook routes require `SERVICE_TOKEN` (Bearer) except PagerDuty, which verifies the v3 HMAC
+signature with `PAGERDUTY_WEBHOOK_SECRET`. Firing alerts enqueue an investigation; resolved or
+acknowledged events are ignored.
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/webhooks/generic \
+  -H "Authorization: Bearer $SERVICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"ticket_id":"ALERT-42","description":"Web_App cannot reach DB_Primary:443","severity":"high"}'
+```
+
+| Route | Source |
+| --- | --- |
+| `POST /api/v1/webhooks/generic` | Custom JSON or `{ "event": "incident.opened", "incident": {...} }` |
+| `POST /api/v1/webhooks/alertmanager` | Prometheus Alertmanager v4 webhook |
+| `POST /api/v1/webhooks/pagerduty` | PagerDuty v3 incident webhook (HMAC signed) |
+
 ### Golden path without Ollama (CI / sanity)
 
 ```bash
 python scripts/golden_path.py
-cd apps/api && pytest -q
+python scripts/eval_incidents.py   # score the full golden corpus
+python scripts/eval_live.py        # live model gate (needs Ollama or vLLM)
+cd apps/api && pytest -q -m "not integration"
+scripts/lab_stores_test.sh         # real Postgres + Neo4j integration gate
 ```
 
 The scripted LLM walks the same tool sequence and asserts interrupt before `execute_change`.
@@ -189,12 +215,7 @@ proves the seeded deny with a real packet, verifies a shadowed change is
 automatically rolled back, verifies a correctly positioned change passes, and
 destroys the lab.
 
-The script runs pinned Containerlab 0.78.2 through Docker, validates the topology,
-checks the read-only EOS adapter, sends a real TCP/443 packet through the
-three-node lab, proves apply and automatic rollback, restores the seeded policy
-and destroys the lab.
-
-## Docker Compose (API + web)
+## Docker Compose (API + worker + web)
 
 Ollama stays on the host. The container reads `OLLAMA_BASE_URL_DOCKER` (default
 `host.docker.internal:11434`) rather than `OLLAMA_BASE_URL`, so the host setting in `.env` cannot
@@ -205,34 +226,75 @@ docker compose up -d --build
 ```
 
 - API: http://localhost:8000/health — lists any degradation and returns `503` while one is active
+- Metrics: http://localhost:8000/metrics
 - Neo4j browser: http://localhost:7474 (neo4j / zeronode)
 - Web: http://localhost:3000
+
+Compose starts a dedicated `worker` service that leases investigation jobs from
+Postgres. Without it, `/health` reports `worker: no live investigation worker
+heartbeat`. For single-process local runs only, set `WORKER_EMBEDDED=true`.
+
+Backup and restore (includes the audit anchor file):
+
+```bash
+scripts/backup_datastores.sh
+scripts/restore_datastores.sh backups/<stamp> --confirm
+scripts/backup_restore_drill.sh
+```
+
+Production deploy (runs config preflight, uses `docker-compose.prod.yml`):
+
+```bash
+cp .env.example .env   # set JWT_SECRET, AUDIT_SIGNING_KEY, PRODUCTION_BASELINE=true, COOKIE_SECURE=true
+./scripts/deploy.sh up
+```
 
 ## API
 
 | Method | Path | Role |
 | --- | --- | --- |
 | POST | `/api/v1/incidents/trigger` | Dispatch a thread (`ticket_id` = LangGraph `thread_id`) |
+| POST | `/api/v1/webhooks/generic` | Normalized generic alert webhook (`SERVICE_TOKEN`) |
+| POST | `/api/v1/webhooks/alertmanager` | Prometheus Alertmanager v4 webhook (`SERVICE_TOKEN`) |
+| POST | `/api/v1/webhooks/pagerduty` | PagerDuty v3 webhook (HMAC signature) |
 | GET | `/api/v1/incidents` | List incidents |
 | GET | `/api/v1/incidents/{id}/status` | Pause flag, path, proposed actions, trace |
 | POST | `/api/v1/incidents/{id}/resume` | `{ "decision": "approve" \| "reject", "feedback": "" }`. Outside a change window an admin may add `override_window` and `override_reason` |
+| GET | `/api/v1/audit/verify` | Ledger verification (`chain_ok`, `protected`) |
 
 ## Repo
 
 ```
 docs/how-it-works.md  system walkthrough + production plan
+docs/using-zeronode.md how to use ZeroNode in day-to-day work (by role)
+docs/runbooks/        deploy, upgrade, and on-call guides
 docs/architecture.md  product thesis
 docker-compose.yml
+docker-compose.prod.yml  production overrides (no public DB ports)
+infra/deploy/pins.env    pinned third-party image tags
 infra/neo4j/          schema + DMZ/TRUST seed
 infra/fakeasa/        device-shaped SSH test server
-infra/containerlab/   three-node EOS lab definition (image not included)
+infra/containerlab/   three-node Nokia SR Linux lab (public image)
 apps/api/             FastAPI, LangGraph, tools, change simulator, tests
 apps/web/             Next.js HITL dashboard
 scripts/golden_path.py    scripted end-to-end run, no Ollama needed
+scripts/eval_incidents.py golden incident corpus + scorers (CI gate)
+scripts/eval_live.py       live Ollama/vLLM eval (manual release gate)
 scripts/e2e_walkthrough.py authenticated live-model walkthrough
 scripts/ingest_netbox.py  read NetBox topology into Neo4j
 scripts/lab_device_test.sh run SSH execution tests safely
 scripts/lab_containerlab_test.sh validate Phase 2 against Nokia SR Linux
+scripts/backup_datastores.sh      versioned Neo4j + Postgres backup
+scripts/restore_datastores.sh     guarded restore (requires --confirm)
+scripts/backup_restore_drill.sh   disposable backup/restore proof
+scripts/deploy.sh             reproducible prod compose deploy
+scripts/lab_stores_test.sh    real Postgres + Neo4j integration tests
+scripts/lab_device_test.sh    SSH device integration tests (fake-asa emulator)
+scripts/ci_wait_fake_asa.py   wait for fake-asa in CI/device runs
+scripts/validate_production_config.py  production preflight checker
+scripts/load_test.py          read-only load test (/health, /metrics)
+scripts/soak_test.sh          sustained load gate
+scripts/regenerate_lock.sh    refresh apps/api/requirements.lock
 scripts/probe_turn.py     print the model's raw reply for one turn
 ```
 

@@ -105,7 +105,7 @@ def make_device_firewall(
         ),
         "acl_name": (acl_name or settings.firewall_acl) or None,
         "device_id": device_id or settings.firewall_device_id,
-        "port": port,
+        "port": port if port != 22 else settings.firewall_port,
         "timeout": timeout,
     }
 

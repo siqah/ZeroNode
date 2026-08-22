@@ -1,0 +1,35 @@
+{
+  "id": "same_zone_block",
+  "ticket_id": "INC-2001",
+  "topology": "same_zone",
+  "topology_site": "DC1",
+  "firewall": "same_zone",
+  "alert": "New Alert: App_Server cannot reach DB_Replica:8080",
+  "scripted_responses": [
+    "<thinking>\n1. Analyze alert: App_Server cannot reach DB_Replica on tcp/8080.\n2. Topology needed: check whether the path crosses a security zone.\n3. Next action: security_boundary_check\n</thinking>\n<tool_call>\n{\"name\": \"security_boundary_check\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\"}}\n</tool_call>",
+    "<thinking>\n1. Analyze alert: both hosts are in TRUST, no zone boundary.\n2. Topology needed: shortest path to name devices for the specialist.\n3. Next action: trace_network_path\n</thinking>\n<tool_call>\n{\"name\": \"trace_network_path\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\"}}\n</tool_call>",
+    "<thinking>\n1. Analyze alert: path crosses Internal_FW inside TRUST.\n2. Topology needed: done.\n3. Next action: delegate_to_firewall_specialist\n</thinking>\n<tool_call>\n{\"name\": \"delegate_to_firewall_specialist\", \"arguments\": {\"context\": \"App_Server cannot reach DB_Replica on tcp/8080 inside TRUST. Path: App_Server -> SW_TRUST -> Internal_FW -> DB_Replica.\", \"target_devices\": [\"Internal_FW\", \"App_Server\", \"DB_Replica\"]}}\n</tool_call>",
+    "<thinking>\n1. What do I know? Same-zone traffic is blocked on Internal_FW.\n2. Which tool next? get_denied_flows on port 8080\n</thinking>\n<tool_call>\n{\"name\": \"get_denied_flows\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\", \"port\": 8080}}\n</tool_call>",
+    "<thinking>\n1. What do I know? ACL-INT-20 denies App_Server to DB_Replica:8080.\n2. Which tool next? propose_policy_change on Internal_FW with IOS syntax\n</thinking>\n<tool_call>\n{\"name\": \"propose_policy_change\", \"arguments\": {\"device_id\": \"Internal_FW\", \"command\": \"ip access-list extended INTERNAL permit tcp host 10.30.1.10 host 10.30.1.50 eq 8080\", \"position\": 19, \"rationale\": \"ACL-INT-20 denies App_Server->DB_Replica:8080. Insert permit at line 19 on Internal_FW.\"}}\n</tool_call>"
+  ],
+  "expect": {
+    "pause_at": "execute_change",
+    "tool_sequence_contains": [
+      "security_boundary_check",
+      "trace_network_path",
+      "delegate_to_firewall_specialist",
+      "get_denied_flows",
+      "propose_policy_change"
+    ],
+    "proposal": {
+      "device": "Internal_FW",
+      "command_contains": ["permit tcp", "10.30.1.10", "10.30.1.50"],
+      "position": 19,
+      "verified": true
+    },
+    "zone_context_contains": "crosses_boundary=false",
+    "max_inferred_turns": 0,
+    "max_parse_errors": 0,
+    "max_verify_attempts": 1
+  }
+}

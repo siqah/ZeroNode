@@ -58,9 +58,17 @@ def reachable() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not reachable(), reason=f"no device emulator on {HOST}:{PORT}"
-)
+pytestmark = pytest.mark.device
+
+
+@pytest.fixture(scope="session", autouse=True)
+def require_device_emulator():
+    if reachable():
+        return
+    reason = f"no device emulator on {HOST}:{PORT}"
+    if os.environ.get("REQUIRE_DEVICE_EMULATOR", "").lower() in {"1", "true", "yes"}:
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 @pytest.fixture

@@ -40,12 +40,12 @@ UNREACHABLE = "postgresql://nobody@127.0.0.1:1/none?connect_timeout=1"
 def test_strict_mode_refuses_to_start_without_postgres(monkeypatch):
     monkeypatch.setattr("app.config.settings.database_url", UNREACHABLE)
     with pytest.raises(RuntimeError, match="nothing is durable"):
-        asyncio.run(open_pool(strict=True, timeout=2))
+        asyncio.run(open_pool(strict=True, resolver=SecretResolver(), timeout=2))
 
 
 def test_relaxed_mode_reports_the_loss_of_durability(monkeypatch):
     monkeypatch.setattr("app.config.settings.database_url", UNREACHABLE)
-    pool, degradation = asyncio.run(open_pool(strict=False, timeout=2))
+    pool, degradation = asyncio.run(open_pool(strict=False, resolver=SecretResolver(), timeout=2))
     assert pool is None
     assert "lost on restart" in degradation
 

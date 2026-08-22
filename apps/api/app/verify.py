@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.firewall.base import FirewallStore
-from app.firewall.policy import AclRule, breadth, evaluate_flow, parse_acl_command
+from app.firewall.normalize import parse_proposed_acl
+from app.firewall.policy import AclRule, breadth, evaluate_flow
 
 
 @dataclass
@@ -92,7 +93,8 @@ def verify_rollback(
     reversal = rollback.strip() or derive_rollback(command)
 
     device = str(action.get("device", ""))
-    proposed = parse_acl_command(command)
+    vendor = str(action.get("vendor") or "")
+    proposed = parse_proposed_acl(command, vendor=vendor)
     if proposed is None:
         return RollbackReport(
             False, reversal, source, [f"{device}: the proposed command does not parse."]
@@ -105,7 +107,7 @@ def verify_rollback(
     )
     after_change = base + [proposed]
 
-    removal = _removal_target(reversal)
+    removal = _removal_target(reversal, vendor=vendor)
     if removal is not None:
         if not _same_rule(removal, proposed):
             return RollbackReport(
@@ -124,7 +126,7 @@ def verify_rollback(
         restored = base
     else:
         # Not a removal, so treat it as a compensating rule appended after the change.
-        compensating = parse_acl_command(reversal)
+        compensating = parse_proposed_acl(reversal, vendor=vendor)
         if compensating is None:
             return RollbackReport(
                 False,
@@ -171,11 +173,11 @@ def verify_rollback(
     )
 
 
-def _removal_target(command: str) -> AclRule | None:
+def _removal_target(command: str, *, vendor: str = "") -> AclRule | None:
     text = (command or "").strip()
     if not text.lower().startswith("no "):
         return None
-    return parse_acl_command(text[3:])
+    return parse_proposed_acl(text[3:], vendor=vendor)
 
 
 def _same_rule(left: AclRule, right: AclRule) -> bool:
@@ -259,7 +261,8 @@ def verify_change(
     for action in actions:
         device = str(action.get("device", ""))
         command = str(action.get("command", ""))
-        rule = parse_acl_command(command)
+        vendor = str(action.get("vendor") or "")
+        rule = parse_proposed_acl(command, vendor=vendor)
         if rule is None:
             ok = False
             lines.append(f"{device}: could not parse '{command}' as an ACL rule.")

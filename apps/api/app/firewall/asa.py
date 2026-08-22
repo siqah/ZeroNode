@@ -41,7 +41,6 @@ ACL_LINE_RE = re.compile(
 )
 HITCNT_RE = re.compile(r"\(hitcnt=(\d+)\)", re.IGNORECASE)
 HEADER_RE = re.compile(r"^access-list\s+\S+;", re.IGNORECASE)
-GROUP_KEYWORDS = ("object-group", "object", "interface")
 # Guards against a rule whose object-groups expand into an unusable number of rules.
 MAX_EXPANSION = 2048
 

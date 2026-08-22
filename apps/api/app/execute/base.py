@@ -58,6 +58,14 @@ class ExecutionResult:
             "verification": self.verification,
             "commands": [step.command for step in self.steps],
             "errors": [step.error for step in self.steps if step.error],
+            "steps": [
+                {
+                    "command": step.command,
+                    "output": step.output,
+                    "error": step.error,
+                }
+                for step in self.steps
+            ],
         }
 
 

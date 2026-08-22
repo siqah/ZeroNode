@@ -30,6 +30,3 @@ class SlidingWindow:
 
         hits.append(moment)
         return True, 0
-
-    def reset(self, key: str) -> None:
-        self._hits.pop(key, None)

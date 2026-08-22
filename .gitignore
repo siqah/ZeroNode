@@ -30,6 +30,7 @@ id_ed25519*
 # Local runtime state. The ledger anchor file is evidence, not source; the
 # default location is .zeronode/, but AUDIT_ANCHOR_FILE may point anywhere.
 .zeronode/
+backups/
 *anchors*.jsonl
 *.pid
 *.sock
@@ -82,6 +83,7 @@ infra/containerlab/*.qcow2
 infra/containerlab/*.img
 infra/containerlab/*.iso
 infra/containerlab/*.bin
+infra/containerlab/clab-zeronode/
 *.pcap
 *.pcapng
 

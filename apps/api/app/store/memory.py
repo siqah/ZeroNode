@@ -19,14 +19,36 @@ class InMemoryTopology:
     def __init__(self, devices: dict[str, dict] | None = None) -> None:
         self.devices = devices or LAB_DEVICES
 
-    def known_devices(self) -> list[str]:
-        return sorted(self.devices)
+    def _device_site(self, device_name: str) -> str:
+        node = self.devices.get(device_name) or {}
+        return str(node.get("site") or "")
 
-    def device_ip(self, device_name: str) -> str | None:
+    def _site_match(self, device_name: str, site: str) -> bool:
+        if not site:
+            return True
+        device_site = self._device_site(device_name)
+        return not device_site or device_site == site
+
+    def known_devices(self, *, site: str = "") -> list[str]:
+        site = (site or "").strip()
+        return sorted(
+            name for name in self.devices if self._site_match(name, site)
+        )
+
+    def device_ip(self, device_name: str, *, site: str = "") -> str | None:
+        if not self._site_match(device_name, site):
+            return None
         node = self.devices.get(device_name)
         return node.get("ip") if node else None
 
-    def path_trace(self, source_device: str, target_device: str) -> list[str] | None:
+    def path_trace(
+        self, source_device: str, target_device: str, *, site: str = ""
+    ) -> list[str] | None:
+        site = (site or "").strip()
+        if not self._site_match(source_device, site) or not self._site_match(
+            target_device, site
+        ):
+            return None
         if source_device not in self.devices or target_device not in self.devices:
             return None
         queue: deque[tuple[str, list[str]]] = deque([(source_device, [source_device])])
@@ -36,27 +58,36 @@ class InMemoryTopology:
             if node == target_device:
                 return path
             for neighbor in self.devices[node]["neighbors"]:
-                if neighbor not in seen:
-                    seen.add(neighbor)
-                    queue.append((neighbor, path + [neighbor]))
+                if neighbor in seen or not self._site_match(neighbor, site):
+                    continue
+                seen.add(neighbor)
+                queue.append((neighbor, path + [neighbor]))
         return None
 
-    def blast_radius(self, device_name: str) -> list[NeighborImpact]:
+    def blast_radius(self, device_name: str, *, site: str = "") -> list[NeighborImpact]:
+        site = (site or "").strip()
         node = self.devices.get(device_name)
-        if not node:
+        if not node or not self._site_match(device_name, site):
             return []
         impacts: list[NeighborImpact] = []
         for neighbor in node["neighbors"]:
+            if not self._site_match(neighbor, site):
+                continue
             zone = self.devices[neighbor]["zone"]
             impacts.append(NeighborImpact(device=neighbor, security_zone=zone))
         return impacts
 
     def security_boundary(
-        self, source_device: str, target_device: str
+        self, source_device: str, target_device: str, *, site: str = ""
     ) -> BoundaryResult | None:
+        site = (site or "").strip()
         src = self.devices.get(source_device)
         dst = self.devices.get(target_device)
         if not src or not dst:
+            return None
+        if not self._site_match(source_device, site) or not self._site_match(
+            target_device, site
+        ):
             return None
         return BoundaryResult(
             source_zone=src["zone"],

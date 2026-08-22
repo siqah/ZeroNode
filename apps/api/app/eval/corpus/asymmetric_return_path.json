@@ -1,0 +1,29 @@
+{
+  "id": "asymmetric_return_path",
+  "ticket_id": "INC-2002",
+  "topology": "asymmetric",
+  "topology_site": "DC1",
+  "firewall": "asymmetric",
+  "alert": "New Alert: App_Server reaches DB_Replica but return traffic fails",
+  "scripted_responses": [
+    "<thinking>\n1. Analyze alert: asymmetric routing suspected on App_Server to DB_Replica.\n2. Topology needed: confirm zone crossing before routing analysis.\n3. Next action: security_boundary_check\n</thinking>\n<tool_call>\n{\"name\": \"security_boundary_check\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\"}}\n</tool_call>",
+    "<thinking>\n1. Analyze alert: zones differ between APP and DATA.\n2. Topology needed: trace the forward path.\n3. Next action: trace_network_path\n</thinking>\n<tool_call>\n{\"name\": \"trace_network_path\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\"}}\n</tool_call>",
+    "<thinking>\n1. Analyze alert: path crosses two core routers; no ACL deny expected.\n2. Topology needed: done.\n3. Next action: delegate_to_firewall_specialist to rule out policy\n</thinking>\n<tool_call>\n{\"name\": \"delegate_to_firewall_specialist\", \"arguments\": {\"context\": \"Forward path App_Server -> R1_A -> R2_B -> DB_Replica succeeds but return traffic fails. Suspect asymmetric routing.\", \"target_devices\": [\"R1_A\", \"R2_B\"]}}\n</tool_call>",
+    "<thinking>\n1. What do I know? Need to confirm this is not an ACL drop.\n2. Which tool next? get_denied_flows\n</thinking>\n<tool_call>\n{\"name\": \"get_denied_flows\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\"}}\n</tool_call>",
+    "<thinking>\n1. What do I know? No denied flows; issue is asymmetric return path, not firewall policy.\n2. Next action: resolve_without_change\n</thinking>\n<tool_call>\n{\"name\": \"resolve_without_change\", \"arguments\": {\"summary\": \"No ACL deny on App_Server->DB_Replica. Forward and return paths differ across R1_A/R2_B; escalate to routing for asymmetric path correction.\"}}\n</tool_call>"
+  ],
+  "expect": {
+    "pause_at": "__end__",
+    "tool_sequence_contains": [
+      "security_boundary_check",
+      "trace_network_path",
+      "delegate_to_firewall_specialist",
+      "get_denied_flows",
+      "resolve_without_change"
+    ],
+    "zone_context_contains": "crosses_boundary=true",
+    "findings_summary_contains": "asymmetric",
+    "max_inferred_turns": 0,
+    "max_parse_errors": 0
+  }
+}

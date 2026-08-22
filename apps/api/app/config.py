@@ -13,6 +13,20 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma4:e4b"
     ollama_num_predict: int = 640
+    # NetBox topology ingest (Phase 5). When URL and token are set, the API
+    # refreshes Neo4j on startup and on an interval.
+    netbox_url: str = ""
+    netbox_token: str = ""
+    netbox_verify_tls: bool = True
+    topology_site: str = ""
+    topology_replace_on_ingest: bool = True
+    topology_ingest_interval_seconds: int = 3600
+    topology_stale_seconds: float = 86400.0
+    # Inference backend: local Ollama or an OpenAI-compatible GPU server (vLLM).
+    inference_backend: str = "ollama"  # ollama | openai_compatible
+    openai_compatible_base_url: str = ""
+    openai_compatible_api_key: str = "EMPTY"
+    openai_compatible_model: str = ""
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "zeronode"
@@ -26,6 +40,7 @@ class Settings(BaseSettings):
     firewall_secret: str = ""
     firewall_acl: str = ""
     firewall_device_id: str = "FW_Edge"
+    firewall_port: int = 22
 
     # Auth. Disabling it is a deliberate, loudly logged development choice.
     auth_enabled: bool = True
@@ -92,8 +107,54 @@ class Settings(BaseSettings):
     # Refuse to start on a degraded store rather than quietly losing durability.
     strict_dependencies: bool = True
 
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    # Phase 3 reliability: durable investigation workers and bounded inference.
+    # A worker leases jobs from Postgres; without one, investigations stay queued.
+    worker_id: str = ""
+    worker_concurrency: int = 2
+    worker_poll_seconds: float = 1.0
+    # When true, the API process also runs a worker. Prefer the dedicated
+    # Compose service in production; this is for single-process local runs.
+    worker_embedded: bool = False
+    job_lease_seconds: int = 60
+    job_heartbeat_seconds: int = 15
+    job_max_attempts: int = 5
+    job_queue_capacity: int = 100
+    # Model-call bounds. A hung Ollama call used to block a thread forever.
+    model_timeout_seconds: float = 90.0
+    model_max_retries: int = 2
+    model_retry_backoff_seconds: float = 1.5
+    model_circuit_failures: int = 5
+    model_circuit_reset_seconds: float = 60.0
+    # End-to-end latency budgets for live investigations (0 disables).
+    model_incident_budget_seconds: float = 480.0
+    model_node_budget_seconds: float = 120.0
+    # When false, truncated or malformed model output fails the job instead of
+    # advancing via infer_tool_call. Production should keep this false.
+    model_allow_inference_fallback: bool = False
+    # When true, /health degrades once any inference fallback has been recorded.
+    model_fallback_degrades_health: bool = True
+    # Observability. Metrics are always on; OTLP export is opt-in.
+    log_json: bool = False
+    metrics_enabled: bool = True
+    otel_exporter_otlp_endpoint: str = ""
+    otel_service_name: str = "zeronode"
+    # Outbound ticket/notification webhooks: transient failures are retried briefly.
+    outbound_max_retries: int = 2
+    outbound_retry_backoff_seconds: float = 0.5
+
+    # Inbound alert webhooks.
+    webhooks_enabled: bool = True
+    webhook_rate_limit: int = 60
+    webhook_rate_window_seconds: int = 60
+    webhook_max_body_bytes: int = 262144
+    pagerduty_webhook_secret: str = ""
+    alertmanager_thread_prefix: str = "AM"
+    pagerduty_thread_prefix: str = "PD"
+    webhook_default_site: str = ""
+
+    # Fail closed in production deployments.
+    production_baseline: bool = False
+
     log_level: str = "info"
     cors_origins: str = "http://localhost:3000"
 

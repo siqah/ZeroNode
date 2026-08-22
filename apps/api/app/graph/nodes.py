@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -27,8 +28,11 @@ from app.graph.parser import (
 )
 from app.graph.prompts import FIREWALL_PROMPT, SUPERVISOR_PROMPT
 from app.graph.state import NetworkAgentState
+from app.inference.errors import InferenceFallbackDisabled, ModelBudgetExceeded
+from app.observability import Metrics
 from app.sanitize import clean_device_output
 from app.store import TopologyStore
+from app.store.site_scoped import scoped_topology
 from app.tools import FIREWALL_TOOLS, SUPERVISOR_TOOLS, ToolContext, ToolSpec
 from app.verify import verify_change
 
@@ -38,44 +42,120 @@ class AgentRuntime:
     llm: BaseChatModel
     topology: TopologyStore
     firewall: FirewallStore
+    metrics: Metrics | None = None
+    model_node_budget_seconds: float = 0.0
+    model_incident_budget_seconds: float = 0.0
+    model_allow_inference_fallback: bool = False
 
-    @property
-    def tool_context(self) -> ToolContext:
-        return ToolContext(topology=self.topology, firewall=self.firewall)
+    def tool_context(self, state: NetworkAgentState) -> ToolContext:
+        site = str(state.get("topology_site") or "").strip()
+        topology = scoped_topology(self.topology, site)
+        return ToolContext(topology=topology, firewall=self.firewall)
+
+
+_FORMAT_NUDGE = (
+    "Format error: reply with only "
+    '<tool_call>{"name":"...","arguments":{...}}</tool_call>'
+)
+
+
+def _check_budgets(
+    agent: AgentRuntime,
+    state: NetworkAgentState,
+    node: str,
+) -> None:
+    incident_elapsed = float(state.get("model_elapsed_seconds") or 0.0)
+    node_elapsed = float((state.get("model_seconds_by_node") or {}).get(node, 0.0))
+    if (
+        agent.model_incident_budget_seconds > 0
+        and incident_elapsed >= agent.model_incident_budget_seconds
+    ):
+        if agent.metrics is not None:
+            agent.metrics.observe_budget_exceeded("incident")
+        raise ModelBudgetExceeded(
+            f"incident model budget exceeded ({incident_elapsed:.1f}s "
+            f">= {agent.model_incident_budget_seconds:.1f}s)"
+        )
+    if agent.model_node_budget_seconds > 0 and node_elapsed >= agent.model_node_budget_seconds:
+        if agent.metrics is not None:
+            agent.metrics.observe_budget_exceeded("node")
+        raise ModelBudgetExceeded(
+            f"node {node!r} model budget exceeded ({node_elapsed:.1f}s "
+            f">= {agent.model_node_budget_seconds:.1f}s)"
+        )
+
+
+def _parse_model_response(
+    response,
+    content: str,
+) -> tuple[ParsedToolCall | None, str]:
+    native = list(getattr(response, "tool_calls", None) or [])
+    if native:
+        return (
+            ParsedToolCall(
+                name=str(native[0].get("name") or ""),
+                arguments=dict(native[0].get("args") or {}),
+            ),
+            "native",
+        )
+    parsed = parse_tool_call(content)
+    if parsed is not None:
+        return parsed, "xml"
+    return None, "error"
+
+
+def _timing_update(node: str, elapsed: float) -> dict:
+    return {
+        "model_elapsed_seconds": elapsed,
+        "model_seconds_by_node": {node: elapsed},
+    }
 
 
 def run_xml_turn(
     state: NetworkAgentState,
     agent: AgentRuntime,
     *,
+    node: str,
     system_prompt: str,
     tools: dict[str, ToolSpec],
     default_goto: str,
     extra_system: str = "",
 ) -> Command:
+    _check_budgets(agent, state, node)
     sys = system_prompt
     if extra_system:
         sys = system_prompt + "\n\n" + extra_system
     prompt_messages = [SystemMessage(content=sys), *state.get("messages", [])]
-    response = agent.llm.invoke(prompt_messages)
-    content = message_text(response.content)
-    if "<tool_call>" in content.lower() and "</tool_call>" not in content.lower():
-        content = content.rstrip() + "\n</tool_call>"
-    thinking = extract_thinking(content)
 
-    # Once the history holds a tool call, Ollama's Gemma template answers with a
-    # native tool_calls payload and empty content, so check that before the XML.
-    native = list(getattr(response, "tool_calls", None) or [])
-    parsed = None
-    if native:
-        parsed = ParsedToolCall(
-            name=str(native[0].get("name") or ""),
-            arguments=dict(native[0].get("args") or {}),
-        )
-    if parsed is None:
-        parsed = parse_tool_call(content)
+    total_elapsed = 0.0
+    model_outcome = "error"
+    response = None
+    content = ""
+
+    for attempt in range(2):
+        started = time.perf_counter()
+        response = agent.llm.invoke(prompt_messages)
+        call_elapsed = time.perf_counter() - started
+        total_elapsed += call_elapsed
+        content = message_text(response.content)
+        if "<tool_call>" in content.lower() and "</tool_call>" not in content.lower():
+            content = content.rstrip() + "\n</tool_call>"
+        parsed, model_outcome = _parse_model_response(response, content)
+        if parsed is not None:
+            break
+        if attempt == 0 and not agent.model_allow_inference_fallback:
+            prompt_messages = [
+                *prompt_messages,
+                AIMessage(content=content),
+                HumanMessage(content=_FORMAT_NUDGE),
+            ]
+            continue
+        break
+
+    thinking = extract_thinking(content)
+    parsed, model_outcome = _parse_model_response(response, content)
     inferred = False
-    if parsed is None:
+    if parsed is None and agent.model_allow_inference_fallback:
         parsed = infer_tool_call(
             allowed=set(tools),
             topology_context=state.get("topology_context") or "",
@@ -84,9 +164,24 @@ def run_xml_turn(
             messages=list(state.get("messages") or []),
         )
         inferred = parsed is not None
+        if inferred:
+            model_outcome = "inferred"
+    elif parsed is None:
+        if agent.metrics is not None:
+            agent.metrics.observe_inference_fallback(node, "blocked")
+        raise InferenceFallbackDisabled(
+            f"{node} did not emit a valid tool call and inference fallback is disabled"
+        )
+
+    if agent.metrics is not None:
+        agent.metrics.observe_model(model_outcome, total_elapsed)
+        agent.metrics.observe_node(node, total_elapsed)
 
     ai_message = AIMessage(content=content)
-    update: dict = {"messages": [ai_message]}
+    update: dict = {
+        "messages": [ai_message],
+        **_timing_update(node, total_elapsed),
+    }
     if thinking:
         update["reasoning_trace"] = [thinking]
     elif parsed is not None:
@@ -95,19 +190,19 @@ def run_xml_turn(
         update["reasoning_trace"] = [f"Chose {parsed.name}({args_text})"]
     if inferred and parsed is not None:
         update["tool_log"] = [f"inferred {parsed.name} after truncated model output"]
+        if agent.metrics is not None:
+            agent.metrics.observe_inference_fallback(node, "inferred")
 
     if parsed is None:
         update["messages"] = [
             ai_message,
-            HumanMessage(
-                content=(
-                    "Format error: reply with only "
-                    '<tool_call>{"name":"...","arguments":{...}}</tool_call>'
-                )
-            ),
+            HumanMessage(content=_FORMAT_NUDGE),
         ]
         snippet = content[:400].replace("\n", " ")
         update["tool_log"] = [f"parse_error: {snippet}"]
+        if agent.metrics is not None:
+            agent.metrics.observe_inference_fallback(node, "parse_error")
+            agent.metrics.observe_model("parse_error", total_elapsed)
         return Command(goto=default_goto, update=update)
 
     spec = tools.get(parsed.name)
@@ -157,7 +252,7 @@ def run_xml_turn(
         ]
         return Command(goto=default_goto, update=update)
 
-    result = spec.handler(args, dict(state), agent.tool_context)
+    result = spec.handler(args, dict(state), agent.tool_context(state))
     # Tool output carries device text, and an ACL remark is somewhere an attacker
     # with config access can leave a message for the model.
     tool_content = clean_device_output(result.content)
@@ -214,6 +309,7 @@ def supervisor_node(state: NetworkAgentState, agent: AgentRuntime) -> Command:
     return run_xml_turn(
         state,
         agent,
+        node="supervisor",
         system_prompt=SUPERVISOR_PROMPT,
         tools=SUPERVISOR_TOOLS,
         default_goto="supervisor",
@@ -229,6 +325,7 @@ def firewall_node(state: NetworkAgentState, agent: AgentRuntime) -> Command:
     return run_xml_turn(
         state,
         agent,
+        node="firewall_specialist",
         system_prompt=FIREWALL_PROMPT,
         tools=FIREWALL_TOOLS,
         default_goto="firewall_specialist",
@@ -279,7 +376,18 @@ def execute_change(
         str(item.get("rollback", "")).strip() for item in actions if item.get("rollback")
     )
 
-    result = (executor or DryRunExecutor()).apply(actions, flows)
+    result_executor = executor or DryRunExecutor()
+    operation_key = (state.get("operation_key") or "").strip()
+    apply_once = getattr(result_executor, "apply_once", None)
+    if callable(apply_once) and operation_key:
+        result = apply_once(
+            actions,
+            flows,
+            operation_key=operation_key,
+            thread_id=str(state.get("incident_id") or ""),
+        )
+    else:
+        result = result_executor.apply(actions, flows)
     headline = {
         LOGGED: f"DRY-RUN approved by {actor} ({verdict}). Commands logged, not executed:",
         APPLIED: f"APPLIED to the device, approved by {actor} ({verdict}):",

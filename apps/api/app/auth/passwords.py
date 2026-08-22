@@ -15,10 +15,3 @@ def verify_password(hashed: str, password: str) -> bool:
         return _hasher.verify(hashed, password)
     except (VerifyMismatchError, VerificationError, ValueError):
         return False
-
-
-def needs_rehash(hashed: str) -> bool:
-    try:
-        return _hasher.check_needs_rehash(hashed)
-    except ValueError:
-        return True

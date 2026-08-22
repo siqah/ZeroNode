@@ -52,10 +52,14 @@ Everything runs on one machine. No telemetry leaves it, and the model is local.
 
 ## 3. Lifecycle of an incident
 
-1. **Trigger.** `POST /api/v1/incidents/trigger` with a `ticket_id`, description and severity.
+1. **Trigger.** An incident may arrive through the dashboard, `POST /api/v1/incidents/trigger`, or
+   normalized inbound webhooks at `/api/v1/webhooks/{generic,alertmanager,pagerduty}`. All paths
+   share the same ingress service: sanitization, stable source-derived `thread_id`s, Postgres
+   persistence, job deduplication, and ticket side effects. Raw webhook JSON never enters the
+   model context. Alertmanager and PagerDuty *resolved* or *acknowledged* events are ignored.
    The ticket id becomes the LangGraph `thread_id`, so an incident and a conversation are the
-   same object. The row is written to Postgres and the graph is started as a background task
-   (`asyncio.create_task`) so the request returns immediately.
+   same object. The row is written to Postgres and a durable investigation job is enqueued so the
+   request returns immediately. A worker process leases the job and drives the graph.
 2. **Investigate.** The graph loops through the `supervisor` node, then `firewall_specialist`,
    calling one tool per turn. Each turn appends to `reasoning_trace` and `tool_log`.
 3. **Pause.** The graph is compiled with `interrupt_before=["execute_change"]`. When the
@@ -65,11 +69,12 @@ Everything runs on one machine. No telemetry leaves it, and the model is local.
    `awaiting_approval`.
 5. **Decide.** `POST /api/v1/incidents/{id}/resume` with `approve` or `reject`, which requires an
    authenticated human holding the `approver` role. The decision, the actor and the evidence they
-   were shown are sealed into the approval ledger *before* the graph resumes with
-   `Command(resume=True, update={...})`. Resuming an incident that is not paused returns `409`.
+   were shown are sealed into the approval ledger *before* a resume job keyed by that ledger hash
+   is enqueued. Resuming an incident that is not paused returns `409`.
 6. **Act.** On approve, `execute_change` re-runs the simulation against what was actually signed
    off, then hands the change to the executor. By default that logs it; with execution enabled for
-   the device it is sent, read back, and reversed if the read-back disagrees. On reject, the
+   the device it is sent, read back, and reversed if the read-back disagrees. Replay of the same
+   approval hash reuses a cached result and will not insert a duplicate ACE. On reject, the
    engineer's feedback is injected as a message and control returns to the specialist to revise.
    The caller gets a receipt carrying the ledger hash.
 7. **Record.** What execution did is sealed into the same chain as the approval, written back to
@@ -376,7 +381,9 @@ to the chain, so an auditor sees where the key changed instead of inferring it f
 failure.
 
 `GET /api/v1/audit/verify` re-derives every hash and signature across all trusted keys, checks the
-anchor, and reports the first break with its index and cause.
+anchor, and reports the first break with its index and cause. The response distinguishes
+`chain_ok` (hash chain and signatures verify) from `protected` (an external anchor is present and
+matches). Production startup refuses to boot when an existing ledger lacks a matching anchor.
 
 The system refuses to act on a decision it cannot record: if the ledger is unreachable while auth
 is enabled, approval returns `503` rather than resuming the graph. An unrecorded approval binds
@@ -605,6 +612,13 @@ at the device now — together with the policy read back off it.
 | `JWT_TTL_MINUTES` | `60` | |
 | `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | empty | First admin, created on startup if absent. Without it and with no users, nobody can log in, which is logged as an error |
 | `SERVICE_TOKEN` | empty | Static token for alerting systems. Pinned to `operator`, and can never approve |
+| `WEBHOOKS_ENABLED` | `true` | Inbound alert webhooks. Set false to disable `/api/v1/webhooks/*` |
+| `WEBHOOK_RATE_LIMIT` / `WEBHOOK_RATE_WINDOW_SECONDS` | `60` / `60` | Per-source rate limit for webhook ingress |
+| `WEBHOOK_MAX_BODY_BYTES` | `262144` | Maximum accepted webhook payload size |
+| `PAGERDUTY_WEBHOOK_SECRET` | empty | HMAC secret for PagerDuty v3 signature verification |
+| `ALERTMANAGER_THREAD_PREFIX` / `PAGERDUTY_THREAD_PREFIX` | `AM` / `PD` | Prefix for stable source-derived incident ids |
+| `WEBHOOK_DEFAULT_SITE` | empty | Default topology site for webhook-normalized incidents |
+| `PRODUCTION_BASELINE` | `false` | Fail closed on startup: auth, JWT, audit key, anchor, TLS cookies, strict deps, no embedded worker, no inference fallback |
 | `COOKIE_SECURE` | `false` | Set true once the dashboard is behind TLS, or session cookies travel in clear |
 | `LOGIN_RATE_LIMIT` / `LOGIN_RATE_WINDOW_SECONDS` | `10` / `60` | Per-IP and per-account throttle. In process, so it multiplies by replica count |
 | `LOGIN_LOCK_THRESHOLD` / `LOGIN_LOCK_MINUTES` | `5` / `15` | Consecutive failures before an account locks, and for how long. Stored in Postgres |
@@ -644,11 +658,18 @@ curl -fsS http://localhost:8000/health
 
 ```bash
 cd apps/api
-.venv/bin/pytest -q                     # device tests skip visibly without the emulator
+.venv/bin/pytest -q -m "not integration"   # fast unit tests; device tests skip without emulator
 .venv/bin/ruff check app tests
-python ../../scripts/golden_path.py     # scripted end-to-end run
-python ../../scripts/probe_turn.py      # print the model's raw reply for one turn
+python ../../scripts/golden_path.py        # scripted end-to-end run
+python ../../scripts/probe_turn.py         # print the model's raw reply for one turn
+../../scripts/lab_stores_test.sh           # real Postgres + Neo4j integration gate
+python ../../scripts/validate_production_config.py  # production preflight (needs PRODUCTION_BASELINE=true)
 ```
+
+CI runs unit tests and the integration suite separately. The integration job uses real Postgres and
+Neo4j service containers and fails if either store is unavailable. Device SSH tests run in a
+separate CI job against the fake-asa emulator (`scripts/ci_wait_fake_asa.py`,
+`scripts/lab_device_test.sh`).
 
 The authenticated live-model walkthrough covers health, login, MFA, investigation, approval,
 dry-run execution and ledger verification:
@@ -668,29 +689,27 @@ instead of the several minutes a full incident needs on CPU.
 
 Being explicit about these matters more than the feature list.
 
-- **Execution has never run against real hardware.** The write path is guarded and has run over
-  real SSH against the device emulator, including a failed verification and rollback. That proves
-  the transport and lifecycle, not vendor behaviour. The next honest test is an L4 Containerlab
-  node.
-- **No device backend has been run against real hardware.** Parsers are tested against captured
-  output and Netmiko has met the SSH emulator's banners, prompts, paging and timeouts, but no
-  backend has met a vendor appliance. `python -m app.firewall.probe` exists to close this in one
-  read-only command; until it is run against a given device, that device is unproven.
+- **Execution has been proven against a real NOS in Containerlab (L4),** not yet against
+  production hardware. The write path is guarded and has run over real SSH against both the
+  device emulator and Nokia SR Linux, including failed verification and rollback.
+- **No device backend has been run against production hardware.** Parsers are tested against
+  captured output and Netmiko has met emulator and lab NOS banners, prompts, paging and
+  timeouts, but no backend has met a vendor appliance in a customer network.
+  `python -m app.firewall.probe` exists to close this in one read-only command.
 - **Expansion has ceilings**: port ranges wider than 64, address ranges spanning more than 16
   prefixes, and rules expanding past 2,048 combinations are left unparsed rather than
   materialised.
-- **Narrow vendor coverage.** Cisco ASA and IOS are the production-targeted parsers; EOS exists
-  for the Containerlab rung. NX-OS, Palo Alto and Fortinet are unimplemented.
+- **Narrow vendor coverage.** Cisco ASA and IOS are the production-targeted parsers; Arista EOS
+  and Nokia SR Linux exist for lab and Containerlab rungs. NX-OS, Palo Alto and Fortinet are
+  unimplemented.
 - **NAT is detected, not modelled.** A translated flow makes the simulator decline to give a
   verdict rather than reason through the translation, so those incidents fall back to a human.
 - **No SSO, and sessions cannot be revoked** before their token expires. Authorisation is not
   scoped per device or per incident, and there is no second-person rule for wide changes.
-- **Investigations do not survive a restart.** State is checkpointed, but the background task
-  driving the graph is in-process; a restart leaves a thread paused mid-investigation with
-  nothing to resume it.
-- **One scenario, five devices, all of it seeded by hand.** The lab proves the workflow, not scale,
-  and the seed was written to fit the queries rather than the other way round. The ladder out of
-  this is in "Test environments" below: a device-shaped SSH server for a real session, NetBox for a real inventory, Containerlab for a real CLI.
+- **Golden corpus, small lab graph.** Four scripted eval incidents cover cross-zone ACL,
+  same-zone ACL, asymmetric routing, and MTU symptoms; the default lab is still five
+  hand-seeded devices. That proves the workflow, not inventory scale — NetBox ingest and
+  Containerlab are the ladder out.
 - **Prompt-injection defence is mitigation, not prevention.** Alert and device text is cleaned,
   fenced and flagged, but pattern matching on natural language loses to rephrasing. What actually
   holds is structural: no execution, evidence read from the device, and a signed human approval.
@@ -700,8 +719,8 @@ Being explicit about these matters more than the feature list.
   permits the flow; it does not open a socket, and nothing here watches whether the application
   actually recovered. Hit counters need traffic to move, so they cannot stand in for it.
 - **Ticketing and notifications are outbound only.** ZeroNode opens, comments on and closes a
-  ticket, but never reads one, so closing an incident in ServiceNow does not close it here. A
-  failed delivery is logged, not retried or queued.
+  ticket, but never reads one, so closing an incident in ServiceNow does not close it here.
+  Transient webhook failures are retried a few times; persistent failure is logged, not queued.
 - **Executed changes are not saved to startup configuration.** Deliberate while execution is new,
   but it means a reload silently undoes an applied fix.
 - **Change windows are enforced at the gate only.** Nothing schedules a change for the next
@@ -727,7 +746,7 @@ fixtures. Three rungs, each answering a question the one below it cannot:
 | --- | --- | --- | --- |
 | L1 | Static fixtures and a seeded Neo4j graph | The state machine, the parsers and the simulator, deterministically and with no hardware | Running |
 | L2 | An SSH server shaped like a device, in Compose | That the client survives a real session, and that a change applied to something that actually changes is verified and undone correctly | Running |
-| L3 | NetBox as the source of truth | That the graph layer answers relational questions against a real inventory rather than a seed written to fit the queries | Built, unrun |
+| L3 | NetBox as the source of truth | That the graph layer answers relational questions against a real inventory rather than a seed written to fit the queries | Shipped: NetBox Compose profile, `run_netbox_ingest`, scheduled refresh, `/health` freshness; validate with `docker compose --profile netbox up` |
 | L4 | Containerlab with a real network OS | That a proposed diff maps onto real interface configuration, on a CLI nobody wrote for us | Passed against Nokia SR Linux 24.10.4 |
 
 L1 is deliberately where the unit tests stay. Determinism is the point: a parser test that needs a
@@ -779,13 +798,10 @@ network: two hosts either side of a firewall, with the shadowing deny already in
 config. The firewall is Nokia SR Linux: a genuine vendor NOS with an official public container
 image, so this rung is repeatable without hardware, a simulator licence or a vendor account.
 
-EOS is IOS-like, not IOS, so it has its own adapter (`app/firewall/eos.py`). The difference that
-matters is that EOS prints prefixes where IOS prints wildcard masks; reusing the IOS parser reads
-`10.10.1.0/24` as a single host and silently narrows every rule it touches.
-
-The image is not redistributable, so downloading it from the Arista software portal is the one
-manual step. Containerlab itself runs in a pinned container with the host PID namespace; no host
-installation or separate VM is required on this Intel Mac.
+SR Linux has its own adapter (`app/firewall/srlinux.py`) and flat candidate renderer. Reads use
+`show acl acl-filter … type ipv4`; writes commit a private candidate. The Arista EOS adapter
+remains available for sites that already run cEOS, but the default L4 gate no longer depends on
+a licensed image.
 
 ```bash
 scripts/lab_containerlab_test.sh
@@ -795,12 +811,10 @@ The validated sequence is read seeded deny → reject a shadowed change through
 live verification → automatic rollback → apply at the correct sequence → pass
 a real TCP/443 request → clean up and confirm the deny is restored.
 
-The harness validates and deploys the topology, waits for EOS SSH, proves the initial policy denies
-a real TCP/443 packet, applies a deliberately shadowed ACE and confirms automatic rollback, applies
-an effective ACE and confirms the packet crosses the firewall, restores the seeded deny, and
-destroys the topology. It publishes EOS SSH as `localhost:2223` because Docker Desktop does not
-route the Containerlab management subnet directly to macOS. The harness supplies `--pid host`; if
-that flag is omitted, nodes can come up unwired.
+The harness validates and deploys the topology, waits for SR Linux SSH on
+`localhost:2223`, proves the initial policy denies a real TCP/443 packet, applies a deliberately
+shadowed ACE and confirms automatic rollback, applies an effective ACE and confirms the packet
+crosses the firewall, restores the seeded deny, and destroys the topology.
 
 One naming note to avoid confusion: these rungs are labelled L1–L4 because the numbered phases
 below already mean something different.
@@ -828,54 +842,60 @@ below already mean something different.
 | ~~Ticket integration (ServiceNow / Jira)~~ | Done as a webhook, and it closes the loop it opens: incident raised, decision, execution outcome, and closure when the investigation ends. A native client can implement the same interface later |
 | ~~Notifications for pending approvals~~ | Done: fired every time the graph stops at the gate, including after a rejection sends the specialist back to re-plan, carrying the command, the simulation verdict, window state, injection flags and a direct link |
 
-What is not done is running any of it against something that can be broken. The gate for that is
-L4 below, and no phase after this one should start before it.
+What is not done is running any of it against production hardware. The L4 Containerlab gate
+against Nokia SR Linux is closed; Phase 3 below builds on that.
 
 ### Phase 3 — Reliability
 
 | Item | Why |
 | --- | --- |
-| Durable job runner (queue or worker) instead of `asyncio.create_task` | Investigations must survive restarts and deploys |
-| Timeouts, retries and circuit breaking on the model call | A hung inference currently blocks a thread indefinitely |
-| Concurrency limits and backpressure | One Ollama instance cannot serve many incidents at once |
-| Structured logging, metrics and tracing | Time per node, tool error rates, approval latency |
-| Backups for Neo4j and Postgres | Checkpoints are the audit trail |
+| ~~Durable job runner (queue or worker) instead of `asyncio.create_task`~~ | Done: PostgreSQL job leases with `FOR UPDATE SKIP LOCKED`, a dedicated Compose `worker` service, and restart-safe start/resume enqueue |
+| ~~Timeouts, retries and circuit breaking on the model call~~ | Done: bounded model wrapper with timeout, transient retries and a circuit that degrades `/health` when open |
+| ~~Concurrency limits and backpressure~~ | Done: worker concurrency caps in-flight graphs; queue capacity returns `503` when saturated |
+| ~~Structured logging, metrics and tracing~~ | Done: optional JSON logs with correlation fields, Prometheus `/metrics`, optional OTLP export |
+| ~~Backups for Neo4j and Postgres~~ | Done: `scripts/backup_datastores.sh`, guarded restore, and `scripts/backup_restore_drill.sh` |
+
+Investigations are enqueued as durable jobs. A worker lease + heartbeat reclaim expires after a
+crash. Resume jobs are keyed by the approval ledger hash so a replay cannot duplicate a device
+mutation; live execution skips a rule that already landed and caches the result under that key.
 
 ### Phase 4 — Model quality
 
 | Item | Why |
 | --- | --- |
-| Evaluation harness with a corpus of golden incidents | Measure tool-call accuracy and proposal quality on every change |
-| Regression gate in CI using the scripted LLM | Cheap protection against prompt and parser regressions |
-| GPU inference or a larger model, with latency budgets | 6–8 minutes is not operational |
-| Reduce reliance on the inference fallback to zero | Track how often it fires as a health metric |
+| ~~Evaluation harness with a corpus of golden incidents~~ | Done: `app/eval/` corpus, scorers, and `python -m app.eval` / `scripts/eval_incidents.py` |
+| ~~Regression gate in CI using the scripted LLM~~ | Done: `.github/workflows/ci.yml` runs ruff, pytest, eval corpus, and `golden_path.py` |
+| ~~GPU inference or a larger model, with latency budgets~~ | Done: `INFERENCE_BACKEND=openai_compatible` for vLLM/GPU; `MODEL_*_BUDGET_SECONDS` enforced in graph/worker |
+| ~~Reduce reliance on the inference fallback to zero~~ | Done: `MODEL_ALLOW_INFERENCE_FALLBACK=false` by default; metrics + `/health`; live gate via `scripts/eval_live.py` |
 
 ### Phase 5 — Scale and coverage
 
 | Item | Why |
 | --- | --- |
-| Topology ingestion from NetBox, LLDP or SNMP, with freshness tracking | A hand-seeded graph does not survive contact with a real network. The L3 environment is where this starts, and it does not have to wait for Phase 5 |
-| Multi-vendor config normalisation | Cisco-only parsing is a hard ceiling |
-| More scenarios: routing, MTU, asymmetric paths, BGP | One scenario proves the workflow, not the coverage an operator needs |
-| Multi-tenancy and per-site isolation | Required for managed-service use |
+| ~~Topology ingestion from NetBox, LLDP or SNMP, with freshness tracking~~ | Done for NetBox: `run_netbox_ingest`, scheduled API refresh, `/health` freshness + stale degradation; LLDP/SNMP remain future |
+| ~~Multi-vendor config normalisation~~ | Done: `app/firewall/normalize.py` strips IOS/EOS wrappers and feeds the shared `AclRule` model; vendor is recorded on proposals and used in simulation |
+| ~~More scenarios: routing, MTU, asymmetric paths, BGP~~ | Done for eval corpus: `same_zone_block`, `asymmetric_return_path`, `mtu_blackhole` plus `cross_zone_block`; dedicated BGP/routing specialists remain future |
+| ~~Multi-tenancy and per-site isolation~~ | Done: `site` on incidents/trigger, `GET /incidents?site=`, per-incident `topology_site` scopes tool queries, `TOPOLOGY_SITE` for process-wide Neo4j |
 
 ### Phase 6 — Operations
 
 | Item | Why |
 | --- | --- |
-| CI/CD with image scanning and pinned dependencies | |
-| Infrastructure as code and reproducible deploys | |
-| Load and soak testing | |
-| Runbooks, on-call, upgrade path | |
+| ~~CI/CD with image scanning and pinned dependencies~~ | Done: `requirements.lock` + lock drift gate in CI, `npm ci` web build, Trivy scan on api/web images |
+| ~~Infrastructure as code and reproducible deploys~~ | Done: `docker-compose.prod.yml`, `infra/deploy/pins.env`, `scripts/deploy.sh` |
+| ~~Load and soak testing~~ | Done: `scripts/load_test.py` (read-only endpoints), `scripts/soak_test.sh` |
+| ~~Runbooks, on-call, upgrade path~~ | Done: `docs/runbooks/` (deploy, upgrade, on-call) |
 
 ### Definition of done for v1
 
 A pilot is credible when, for a single supported vendor and scenario:
 
-1. Every approval is authenticated, attributable and immutable.
-2. Every proposal carries a simulation verdict and a rollback plan.
+1. Every approval is authenticated, attributable and immutable. **Met in code.**
+2. Every proposal carries a simulation verdict and a rollback plan. **Met in code.**
 3. Changes execute against real devices with dry-run as the default and automatic rollback on
-   failed post-change verification.
-4. Topology is ingested automatically and its freshness is visible.
-5. An eval suite gates every deploy, and fallback usage is tracked as a health metric.
-6. A restart never loses an investigation.
+   failed post-change verification. **Met in lab** (emulator + Containerlab); production
+   hardware still required for a customer pilot.
+4. Topology is ingested automatically and its freshness is visible. **Met when NetBox is configured.**
+5. An eval suite gates every deploy, and fallback usage is tracked as a health metric. **Met**
+   (scripted CI corpus; live Ollama eval is a manual release gate).
+6. A restart never loses an investigation. **Met** (durable jobs + worker).

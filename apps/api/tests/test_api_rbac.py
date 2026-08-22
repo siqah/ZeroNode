@@ -59,6 +59,9 @@ def client():
     app.state.mfa_required_for_approvers = True
     app.state.keyset = KeySet(Signer(Signer.generate_seed()))
     app.state.anchor_sink = NullAnchorSink()
+    from app.jobs.dispatcher import InMemoryDispatcher
+
+    app.state.dispatcher = InMemoryDispatcher()
     with TestClient(app) as test_client:
         yield test_client
 

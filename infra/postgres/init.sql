@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     thread_id TEXT PRIMARY KEY,
     description TEXT NOT NULL,
     severity TEXT NOT NULL DEFAULT 'high',
+    site TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -49,3 +50,41 @@ DROP TRIGGER IF EXISTS approvals_no_mutate ON approvals;
 CREATE TRIGGER approvals_no_mutate
 BEFORE UPDATE OR DELETE ON approvals
 FOR EACH ROW EXECUTE FUNCTION approvals_append_only();
+
+-- Durable investigation jobs. Leased by workers with FOR UPDATE SKIP LOCKED.
+CREATE TABLE IF NOT EXISTS investigation_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    kind TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 5,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lease_owner TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS investigation_jobs_poll_idx
+    ON investigation_jobs (status, available_at, id);
+CREATE INDEX IF NOT EXISTS investigation_jobs_thread_idx
+    ON investigation_jobs (thread_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+    worker_id TEXT PRIMARY KEY,
+    concurrency INT NOT NULL DEFAULT 1,
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    meta JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS execution_results (
+    operation_key TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    result JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

@@ -1,0 +1,28 @@
+{
+  "id": "mtu_blackhole",
+  "ticket_id": "INC-2003",
+  "topology": "mtu",
+  "topology_site": "DC1",
+  "firewall": "mtu",
+  "alert": "New Alert: App_Server TCP session to DB_Replica resets after large transfers (possible MTU black hole)",
+  "scripted_responses": [
+    "<thinking>\n1. Analyze alert: large transfers reset; suspect MTU/PMTUD failure.\n2. Topology needed: confirm whether traffic crosses a boundary.\n3. Next action: security_boundary_check\n</thinking>\n<tool_call>\n{\"name\": \"security_boundary_check\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\"}}\n</tool_call>",
+    "<thinking>\n1. Analyze alert: path crosses APP to DATA.\n2. Topology needed: trace path for hop MTU checks.\n3. Next action: trace_network_path\n</thinking>\n<tool_call>\n{\"name\": \"trace_network_path\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\"}}\n</tool_call>",
+    "<thinking>\n1. Analyze alert: path through Edge_Router and Core_Switch.\n2. Topology needed: done.\n3. Next action: delegate_to_firewall_specialist to rule out ACL drop\n</thinking>\n<tool_call>\n{\"name\": \"delegate_to_firewall_specialist\", \"arguments\": {\"context\": \"Large TCP transfers reset between App_Server and DB_Replica. Path: App_Server -> Edge_Router -> Core_Switch -> DB_Replica.\", \"target_devices\": [\"Edge_Router\", \"Core_Switch\"]}}\n</tool_call>",
+    "<thinking>\n1. What do I know? Must exclude firewall deny before blaming MTU.\n2. Which tool next? get_denied_flows\n</thinking>\n<tool_call>\n{\"name\": \"get_denied_flows\", \"arguments\": {\"source_device\": \"App_Server\", \"target_device\": \"DB_Replica\"}}\n</tool_call>",
+    "<thinking>\n1. What do I know? No ACL deny; symptoms match MTU black hole on the path.\n2. Next action: resolve_without_change with MTU finding\n</thinking>\n<tool_call>\n{\"name\": \"resolve_without_change\", \"arguments\": {\"summary\": \"No ACL deny on App_Server->DB_Replica:443. Large-transfer resets indicate an MTU black hole on Edge_Router/Core_Switch; verify interface MTU and PMTUD.\"}}\n</tool_call>"
+  ],
+  "expect": {
+    "pause_at": "__end__",
+    "tool_sequence_contains": [
+      "security_boundary_check",
+      "trace_network_path",
+      "delegate_to_firewall_specialist",
+      "get_denied_flows",
+      "resolve_without_change"
+    ],
+    "findings_summary_contains": "MTU",
+    "max_inferred_turns": 0,
+    "max_parse_errors": 0
+  }
+}

@@ -9,6 +9,7 @@ dependencies = [
   "langgraph>=0.2.45",
   "langchain-core>=0.3.0",
   "langchain-ollama>=0.2.0",
+  "langchain-openai>=0.2.0",
   "langgraph-checkpoint-postgres>=2.0.0",
   "psycopg[binary,pool]>=3.2.0",
   "neo4j>=5.26.0",
@@ -18,11 +19,18 @@ dependencies = [
   "email-validator>=2.2.0",
   "argon2-cffi>=23.1.0",
   "cryptography>=43.0.0",
+  "prometheus-client>=0.21.0",
+  "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]
 devices = [
   "netmiko>=4.4.0",
+]
+observability = [
+  "opentelemetry-api>=1.28.0",
+  "opentelemetry-sdk>=1.28.0",
+  "opentelemetry-exporter-otlp-proto-http>=1.28.0",
 ]
 dev = [
   "pytest>=8.3.0",
@@ -64,6 +72,10 @@ extend-immutable-calls = [
 pythonpath = ["."]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: requires real Postgres and/or Neo4j service containers",
+    "device: requires the fake-asa SSH device emulator",
+]
 # Report skip reasons. The device tests skip themselves when the emulator is
 # not running or the devices extra is missing, and a silent skip reads as a pass.
 addopts = "-rs"

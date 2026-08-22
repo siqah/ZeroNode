@@ -6,13 +6,24 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.firewall.base import FirewallStore, FlowQuery
+from app.firewall.normalize import normalise_vendor
 from app.store import TopologyStore
 from app.verify import verify_change, verify_rollback
 
 MAX_VERIFY_ATTEMPTS = 3
 
 DEVICE_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]*$"
+
+
+def _firewall_platform(firewall: FirewallStore) -> str:
+    platform = getattr(firewall, "platform", None)
+    if callable(platform):
+        return normalise_vendor(platform())
+    if isinstance(platform, str) and platform:
+        return normalise_vendor(platform)
+    return normalise_vendor(settings.firewall_backend)
 
 
 class PathTraceInput(BaseModel):
@@ -222,6 +233,7 @@ def handle_propose_change(
         "command": args.command,
         "rationale": args.rationale,
         "position": args.position,
+        "vendor": _firewall_platform(ctx.firewall),
     }
 
     # Simulate the change before a human is asked to approve it: an engineer
@@ -325,5 +337,11 @@ FIREWALL_TOOLS: dict[str, ToolSpec] = {
         "Queue a CLI/policy change for human approval. Does not execute it.",
         ProposeChangeInput,
         handle_propose_change,  # type: ignore[arg-type]
+    ),
+    "resolve_without_change": ToolSpec(
+        "resolve_without_change",
+        "Close the incident when no ACL change is required.",
+        ResolveInput,
+        handle_resolve,  # type: ignore[arg-type]
     ),
 }

@@ -101,7 +101,3 @@ class ConfigSession(SshDevice):
             # read-back correctly sees no change and every execution rolls back.
             output += conn.commit()
         return output
-
-    def read(self, command: str) -> str:
-        """Read back through the same guard the read path uses."""
-        return self._send(command)

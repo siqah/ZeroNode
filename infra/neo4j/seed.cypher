@@ -11,19 +11,19 @@ MERGE (z:SecurityZone {name: 'UNTRUST'})
 SET z.risk_level = 'high';
 
 MERGE (d:Device {name: 'Web_App'})
-SET d.type = 'server', d.vendor = 'generic', d.management_ip = '10.10.1.10', d.os_version = 'linux';
+SET d.type = 'server', d.vendor = 'generic', d.management_ip = '10.10.1.10', d.os_version = 'linux', d.site = 'lab';
 
 MERGE (d:Device {name: 'SW_DMZ'})
-SET d.type = 'switch', d.vendor = 'cisco', d.management_ip = '10.10.0.2', d.os_version = 'ios-xe';
+SET d.type = 'switch', d.vendor = 'cisco', d.management_ip = '10.10.0.2', d.os_version = 'ios-xe', d.site = 'lab';
 
 MERGE (d:Device {name: 'FW_Edge'})
-SET d.type = 'firewall', d.vendor = 'cisco', d.management_ip = '10.0.0.1', d.os_version = 'asa';
+SET d.type = 'firewall', d.vendor = 'cisco', d.management_ip = '10.0.0.1', d.os_version = 'asa', d.site = 'lab';
 
 MERGE (d:Device {name: 'SW_TRUST'})
-SET d.type = 'switch', d.vendor = 'cisco', d.management_ip = '10.20.0.2', d.os_version = 'ios-xe';
+SET d.type = 'switch', d.vendor = 'cisco', d.management_ip = '10.20.0.2', d.os_version = 'ios-xe', d.site = 'lab';
 
 MERGE (d:Device {name: 'DB_Primary'})
-SET d.type = 'server', d.vendor = 'generic', d.management_ip = '10.20.1.50', d.os_version = 'linux';
+SET d.type = 'server', d.vendor = 'generic', d.management_ip = '10.20.1.50', d.os_version = 'linux', d.site = 'lab';
 
 MATCH (d:Device {name: 'Web_App'}), (z:SecurityZone {name: 'DMZ'})
 MERGE (d)-[:BELONGS_TO]->(z);

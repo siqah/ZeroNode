@@ -95,20 +95,6 @@ async def set_totp_enabled(conn: psycopg.AsyncConnection, email: str, enabled: b
     )
 
 
-async def upsert_user(
-    conn: psycopg.AsyncConnection, email: str, password_hash: str, role: Role
-) -> None:
-    await conn.execute(
-        """
-        INSERT INTO users (email, password_hash, role)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (email) DO UPDATE
-          SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role
-        """,
-        (email.lower(), password_hash, role.value),
-    )
-
-
 async def create_if_absent(
     conn: psycopg.AsyncConnection, email: str, password_hash: str, role: Role
 ) -> bool:

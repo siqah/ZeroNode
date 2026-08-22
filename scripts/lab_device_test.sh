@@ -31,7 +31,9 @@ fi
 started=0
 cleanup() {
   if [[ $started -eq 1 ]]; then
-    "${COMPOSE[@]}" down >/dev/null 2>&1 || true
+    # Only stop the emulator — never `compose down` the whole project stack.
+    "${COMPOSE[@]}" stop fake-asa >/dev/null 2>&1 || true
+    "${COMPOSE[@]}" rm -f fake-asa >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -59,5 +61,5 @@ done
 
 echo "Running device integration tests against $HOST:$PORT"
 cd "$API"
-FAKE_ASA_HOST="$HOST" FAKE_ASA_PORT="$PORT" \
-  "$PYTEST" tests/test_integration_device.py "$@"
+FAKE_ASA_HOST="$HOST" FAKE_ASA_PORT="$PORT" REQUIRE_DEVICE_EMULATOR=true \
+  "$PYTEST" -m device --strict-markers "$@"
